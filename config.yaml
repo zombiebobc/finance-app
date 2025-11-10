@@ -1,0 +1,174 @@
+balance_history_days: 30
+column_mappings:
+  account:
+  - account
+  - account name
+  - account_name
+  - account number
+  - account_number
+  - from account
+  - from_account
+  - to account
+  - to_account
+  amount:
+  - amount
+  - transaction amount
+  - transaction_amount
+  - trans_amount
+  - value
+  - total
+  - balance
+  - debit
+  - credit
+  category:
+  - category
+  - transaction category
+  - transaction_category
+  - type
+  - transaction type
+  - transaction_type
+  - classification
+  - tag
+  date:
+  - date
+  - transaction date
+  - transaction_date
+  - trans_date
+  - posting date
+  - posting_date
+  - posted date
+  - posted_date
+  - date posted
+  - transaction time
+  - time
+  description:
+  - description
+  - transaction description
+  - transaction_description
+  - trans_description
+  - details
+  - memo
+  - notes
+  - payee
+  - merchant
+  - vendor
+  - narrative
+database:
+  path: transactions.db
+  type: sqlite
+default_time_frame: Current
+duplicate_detection:
+  hash_algorithm: md5
+  key_fields:
+  - date
+  - description
+  - amount
+logging:
+  file: import.log
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  level: INFO
+net_worth_goal: 80000.0
+net_worth_history_days: 90
+processing:
+  amount_decimal_places: 2
+  chunk_size: 10000
+  date_formats:
+  - '%Y-%m-%d'
+  - '%m/%d/%Y'
+  - '%d/%m/%Y'
+  - '%Y/%m/%d'
+  - '%m-%d-%Y'
+  - '%d-%m-%Y'
+  - '%Y.%m.%d'
+  - '%m.%d.%Y'
+  - '%d.%m.%Y'
+  output_date_format: '%Y-%m-%d'
+show_sparklines: true
+standard_fields:
+- date
+- description
+- amount
+- category
+- account
+transfer_detection:
+  enabled: true
+  log_detected_transfers: true
+  patterns:
+  - Credit Crd-Pay
+  - Credit Card Payment
+  - CREDIT CARD PAYMENT
+  - EDI PMYTS
+  - DEBIT PMTS
+  - Payment to.*Credit
+  - Payment From.*Checking
+  - .*Card.*Payment
+  - .*Card-Payment
+  - .*Crd-Epay
+  - Credit Crd-Epay
+  - Chase Credit Crd-Epay
+  - .*Card Autopay
+  - Autopay.*Card
+  - Payment.*Card
+  - .*Mobile Pmt
+  - Capital One-Mobile Pmt
+  - Dept Education-Student Ln
+  - .*Student Ln
+  - .*Billpay
+  - Santander Consum-Billpay
+  - .*Loan Payment
+  - Mortgage Payment
+  - Transfer to
+  - Transfer from
+  - TRANSFER TO
+  - TRANSFER FROM
+  - Internal Transfer
+  - Account Transfer
+  - Online.*Transfer
+  - ACH Transfer
+  - Wire Transfer
+  - Wealthfront EDI PYMNTS
+  - Wealthfront EDI PYMNT
+  - .*EDI PYMNT.*
+  - Payment to Wealthfront
+  - Transfer.*Wealthfront
+  - Wealthfront.*Transfer
+  - Wealthfront Investment
+  - Individual Automated Investing Account
+  - .*Automated Investing.*
+  - Payment to Robinhood
+  - Robinhood.*Payment
+  - Transfer.*Robinhood
+  - Robinhood.*Transfer
+  - ROBINHOOD DEBITS
+  - ^Payment$
+  - ^Payment -
+  - ^Payment Received
+  - ^Payment Thank You
+  - Payment to.*Investment
+  - Transfer.*Investment
+  - Investment.*Transfer
+  - .*Investment Account
+  - Transfer.*Savings
+  - Transfer.*Checking
+  - Payment to.*Savings
+  - Payment From.*Savings
+  - Huntington Bank.*
+  - .*\(Personal\).*\(Account.*\)
+  - Online Banking Transfer
+  - Mobile.*Transfer
+  - ZELLE TRANSFER
+  - VENMO TRANSFER TO BANK
+  - PayPal.*Transfer to Bank
+  transfer_category: Transfer
+wealthfront:
+  cash_account_name: Wealthfront Cash Savings
+  investment_account_name: Wealthfront Automated Investment
+  prompt_investment_update: true
+  transfer_patterns:
+  - Transfer to Automated Investing
+  - Transfer to Investment
+  - Wealthfront Investment
+  - Auto-Invest
+  - Transfer.*Investing
+  - Individual Automated Investing Account
+  - .*Automated Investing.*
