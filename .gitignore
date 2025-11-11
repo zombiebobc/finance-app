@@ -1,0 +1,159 @@
+# ------------------------------------------------------------------------------
+# Python ignores
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ------------------------------------------------------------------------------
+# Virtual environments & dependency managers
+# ------------------------------------------------------------------------------
+.venv/
+venv/
+env/
+.env/
+.env
+.env.*
+Pipfile.lock
+poetry.lock
+poetry.toml
+pip-wheel-metadata/
+.python-version
+
+# ------------------------------------------------------------------------------
+# Build artifacts & packaging
+# ------------------------------------------------------------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+*.manifest
+*.spec
+
+# ------------------------------------------------------------------------------
+# Tool caches & test artifacts
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ruff_cache.json
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.benchmarks/
+.hypothesis/
+.tox/
+.nox/
+.cache/
+.log/
+
+# ------------------------------------------------------------------------------
+# Editor & OS cruft
+# ------------------------------------------------------------------------------
+.idea/
+.vscode/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ------------------------------------------------------------------------------
+# Sensitive data & exports
+# ------------------------------------------------------------------------------
+# All real financial data should live inside an ignored directory such as `data/`
+# which stays local-only. Adjust patterns as needed for additional private dirs.
+data/
+data/**
+private_data/
+private_data/**
+secure_data/
+secure_data/**
+backups/
+backups/**
+
+# Any standalone files that commonly contain real transactions
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.ods
+*.xlsm
+*.parquet
+*.feather
+*.jsonl
+*.qif
+*.ofx
+*.qfx
+*.mt940
+
+# Reports, exports, and generated analytics that may embed sensitive info
+exports/
+exports/**
+reports/
+reports/**
+analytics_reports/
+full_analytics_report/
+*.pdf
+*.png
+*.svg
+*.jpg
+*.jpeg
+
+# ------------------------------------------------------------------------------
+# Databases & stateful storage
+# ------------------------------------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+
+# ------------------------------------------------------------------------------
+# Logs containing sensitive content
+# ------------------------------------------------------------------------------
+logs/
+logs/**
+*.log
+*.log.*
+*.out
+*.err
+
+# ------------------------------------------------------------------------------
+# Local config & secrets (template versions stay tracked)
+# ------------------------------------------------------------------------------
+config.local.yaml
+config.local.yml
+config/*.local.yaml
+config/*.secrets.yaml
+.secrets/
+.secrets/**
+*.secrets.json
+*.secrets.yaml
+*.secrets.yml
+*.secrets.toml
+.envrc
+.envrc.local
+
+# ------------------------------------------------------------------------------
+# Notebook checkpoints & data science artefacts
+# ------------------------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# ------------------------------------------------------------------------------
+# Miscellaneous scratch files
+# ------------------------------------------------------------------------------
+*.bak
+*.tmp
+*.temp
+*.orig
+*.old
+*.retry
+.DS_Store?
+
+
