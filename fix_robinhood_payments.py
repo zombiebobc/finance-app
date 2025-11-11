@@ -11,7 +11,11 @@ For Robinhood CSV format:
 """
 
 import logging
+from pathlib import Path
+import yaml
+
 from database_ops import DatabaseManager, Transaction, Account, AccountType
+from utils import ensure_data_dir, resolve_connection_string
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +25,14 @@ logger = logging.getLogger(__name__)
 
 # Account to fix
 ACCOUNT_NAME = "Robinhood Gold Card"
+
+
+def _load_config() -> dict:
+    config_path = Path("config.yaml")
+    if config_path.exists():
+        with open(config_path, "r") as handle:
+            return yaml.safe_load(handle) or {}
+    return {}
 
 
 def fix_robinhood_payments(db_manager: DatabaseManager, dry_run: bool = True) -> None:
@@ -128,7 +140,11 @@ if __name__ == "__main__":
                 print("Aborted.")
                 sys.exit(0)
     
-    db_manager = DatabaseManager('sqlite:///transactions.db')
+    config = _load_config()
+    ensure_data_dir(config)
+    connection_string = resolve_connection_string(config)
+    
+    db_manager = DatabaseManager(connection_string)
     
     try:
         fix_robinhood_payments(db_manager, dry_run=dry_run)

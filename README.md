@@ -30,7 +30,7 @@ A modular Python application for importing financial transaction data from CSV f
 - **Monthly Budget View**: Track assigned, activity, available, and usage percentage for the selected month
 - **Editable Assignments**: Update assigned amounts inline with validation and instant feedback
 - **Budget Envelopes**: Allocate funds to categories with budget periods
-- **Spending Tracking**: Track spending against allocated budgets with real-time updates
+- **Spending Tracking**: Track spending against allocated budgets with real-time updates pulled directly from transactions
 - **Budget Status**: View remaining budget, percentage used, and over/under-budget alerts
 - **Color-coded Indicators**: Green for categories with budget remaining, red for overspending
 - **Period-based Budgets**: Set budgets for specific time periods (monthly, quarterly, etc.)
@@ -47,10 +47,14 @@ A modular Python application for importing financial transaction data from CSV f
    - **Activity (Spent)** updates in real time based on transactions for the selected month.
    - **Available** is color-coded (green > 0, yellow = 0, red < 0) for quick status checks.
    - **Budget Used %** highlights spending progress (warning above 90%, red when overspent).
+   - Only categories with **Assigned > $0** appear in the list to maintain an opt-in workflow; zero-assigned categories remain hidden until funded.
+   - The **Financial Health Snapshot** at the top surfaces income, assignments, unassigned dollars, live spending totals, availability, utilization, and a projection—use the inline income override to keep planning aligned with reality.
+   - Combine granular transaction categories with broader budget envelopes via `budget_category_aliases` in `config.yaml` (e.g., map `"Purchase Amazon"` and `"Purchase Target"` into a single `"Shopping"` budget).
 5. Expand the **View Budget Table** panel to export a tabular view for analysis or CSV export via Streamlit.
 
 Budgets are saved per month using the first and last day of the selected month. The design is extensible, enabling additional period types in future updates.
 
+> **Tip:** The **Financial Health Snapshot** stays visible at the top, even when no categories are funded yet, so you always have an at-a-glance view of totals.
 ### Viewing Features
 - **Command-Line Viewer**: Query and filter transactions from the terminal
 - **Web UI**: Interactive Streamlit-based web interface for viewing transactions
@@ -111,6 +115,13 @@ The application uses `config.yaml` for configuration. Key settings include:
 - **Budget Categories** *(optional)*: Define a `budget_categories` list to seed the budget dropdown when no transaction history is available
 
 See `config.yaml` for detailed configuration options and examples.
+
+### Data Directory
+
+- All persisted financial data lives inside the auto-created `data/` directory.
+- The SQLite file defaults to `data/transactions.db`; override via the `DB_CONNECTION_STRING` env var or `database.connection_string`.
+- CSV imports can be stored in `data/` (or sub-folders) so sensitive files stay gitignored by default.
+- The CLI and Streamlit apps create the directory if it does not exist, ensuring first-run setups succeed without manual steps.
 
 ## Usage
 

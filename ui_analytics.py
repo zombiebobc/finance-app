@@ -6,7 +6,6 @@ exploring financial data with charts, filters, and drill-down.
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Optional, Dict
 from datetime import date
@@ -38,27 +37,23 @@ from config_manager import (
     get_dashboard_preference,
     initialize_session_state
 )
+from utils import ensure_data_dir, resolve_connection_string
 
 logger = logging.getLogger(__name__)
 
 
-def load_config():
-    """Load database configuration from config file or environment."""
+def load_connection_string() -> str:
+    """Resolve the database connection string with data directory initialization."""
     import yaml
     
-    # Try environment variable first
-    connection_string = os.environ.get('DB_CONNECTION_STRING')
-    if connection_string:
-        return connection_string
-    
-    # Fall back to config file
     config_path = Path('config.yaml')
+    config = {}
     if config_path.exists():
         with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-            return config.get('database', {}).get('connection_string', 'sqlite:///transactions.db')
+            config = yaml.safe_load(f) or {}
     
-    return 'sqlite:///transactions.db'
+    ensure_data_dir(config)
+    return resolve_connection_string(config)
 
 
 def display_comparison_summary(
@@ -452,7 +447,7 @@ def main_ui_analytics():
     initialize_session_state()
     
     # Load database
-    connection_string = load_config()
+    connection_string = load_connection_string()
     
     try:
         db_manager = DatabaseManager(connection_string)

@@ -95,6 +95,26 @@ class Budget(Base):
         )
 
 
+class IncomeOverride(Base):
+    """Optional monthly income override values."""
+    
+    __tablename__ = "income_overrides"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    period_start = Column(Date, nullable=False, unique=True, index=True)
+    period_end = Column(Date, nullable=False)
+    override_amount = Column(Float, nullable=False)
+    notes = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    def __repr__(self) -> str:
+        return (
+            f"<IncomeOverride(id={self.id}, period={self.period_start} to {self.period_end}, "
+            f"amount={self.override_amount})>"
+        )
+
+
 class BalanceHistory(Base):
     """
     SQLAlchemy model representing historical balance snapshots.
@@ -234,7 +254,7 @@ class DatabaseManager:
         Initialize the database manager.
         
         Args:
-            connection_string: SQLAlchemy connection string (e.g., 'sqlite:///transactions.db')
+            connection_string: SQLAlchemy connection string (e.g., 'sqlite:///data/transactions.db')
         
         Raises:
             SQLAlchemyError: If database connection fails

@@ -19,6 +19,7 @@ from data_ingestion import CSVReader
 from data_standardization import DataStandardizer
 from duplicate_detection import DuplicateDetector
 from database_ops import DatabaseManager
+from utils import ensure_data_dir, resolve_connection_string, resolve_log_path
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
@@ -38,7 +39,11 @@ def setup_logging(config: dict) -> None:
     
     handlers = [logging.StreamHandler(sys.stdout)]
     if log_file:
-        handlers.append(logging.FileHandler(log_file))
+        try:
+            log_path = resolve_log_path(log_file)
+        except OSError as exc:
+            raise RuntimeError(f"Unable to prepare log file path '{log_file}': {exc}") from exc
+        handlers.append(logging.FileHandler(log_path))
     
     logging.basicConfig(
         level=log_level,
@@ -80,22 +85,7 @@ def create_connection_string(config: dict) -> str:
     Returns:
         SQLAlchemy connection string
     """
-    db_config = config.get("database", {})
-    
-    # Use connection_string if provided
-    if "connection_string" in db_config:
-        return db_config["connection_string"]
-    
-    # Otherwise construct from path/type
-    db_type = db_config.get("type", "sqlite")
-    db_path = db_config.get("path", "transactions.db")
-    
-    if db_type == "sqlite":
-        # SQLite connection string
-        return f"sqlite:///{db_path}"
-    else:
-        # For other databases, would need additional config (user, password, host, etc.)
-        raise ValueError(f"Database type '{db_type}' requires connection_string in config")
+    return resolve_connection_string(config)
 
 
 def import_transactions(
@@ -609,6 +599,13 @@ def main():
         config = load_config(config_path)
     except Exception as e:
         print(f"Error loading config: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Ensure data directory exists before logging/database work
+    try:
+        ensure_data_dir(config)
+    except Exception as exc:
+        print(f"Failed to prepare data directory: {exc}", file=sys.stderr)
         sys.exit(1)
     
     # Setup logging

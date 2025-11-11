@@ -54,8 +54,22 @@ column_mappings:
   - vendor
   - narrative
 database:
+  data_dir: data
   path: transactions.db
   type: sqlite
+  connection_string: sqlite:///data/transactions.db
+  income_categories:
+  - Salary
+  - Paycheck
+  - Bonus
+  - Freelance
+  - Reimbursement
+show_projections: true
+budget_category_aliases:
+  Shopping:
+  - Purchase Target
+  - Purchase Amazon
+  - Purchase Taco Bell
 default_time_frame: Current
 duplicate_detection:
   hash_algorithm: md5
@@ -64,7 +78,7 @@ duplicate_detection:
   - description
   - amount
 logging:
-  file: import.log
+  file: data/import.log
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
   level: INFO
 net_worth_goal: 80000.0

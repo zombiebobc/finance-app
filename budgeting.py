@@ -10,9 +10,9 @@ from typing import List, Optional, Dict, Any, Tuple, Set
 from datetime import datetime, date, timedelta
 from dataclasses import dataclass
 
-from database_ops import DatabaseManager, Budget, Transaction
+from database_ops import DatabaseManager, Budget, Transaction, IncomeOverride, Account
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import func
+from sqlalchemy import func, and_, extract
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -111,7 +111,89 @@ class BudgetManager:
             if key and key not in unique:
                 unique[key] = normalized
         
+        canonical_labels, _, _ = BudgetManager._load_budget_category_aliases()
+        for canonical_key, label in canonical_labels.items():
+            if canonical_key not in unique and label:
+                unique[canonical_key] = label
+        
         return sorted(unique.values(), key=str.casefold)
+    
+    @staticmethod
+    def _load_budget_category_aliases() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, Set[str]]]:
+        """
+        Load budget category alias mappings from configuration.
+        
+        Returns:
+            Tuple of (canonical_labels, alias_lookup, canonical_aliases)
+        """
+        try:
+            from config_manager import load_config  # Lazy import to avoid circular dependency
+        except ImportError:
+            logger.debug("config_manager not available; skipping budget category aliases.")
+            return {}, {}, {}
+        
+        config = load_config()
+        alias_config = config.get("budget_category_aliases", {}) or {}
+        
+        canonical_labels: Dict[str, str] = {}
+        alias_lookup: Dict[str, str] = {}
+        canonical_aliases: Dict[str, Set[str]] = {}
+        
+        for canonical, aliases in alias_config.items():
+            canonical_norm = BudgetManager._normalize_category(str(canonical))
+            if not canonical_norm:
+                continue
+            canonical_key = BudgetManager._category_key(canonical_norm)
+            canonical_labels[canonical_key] = canonical_norm
+            alias_lookup[canonical_key] = canonical_key
+            canonical_aliases.setdefault(canonical_key, set())
+            
+            for alias in aliases or []:
+                alias_norm = BudgetManager._normalize_category(str(alias))
+                if not alias_norm:
+                    continue
+                alias_key = BudgetManager._category_key(alias_norm)
+                alias_lookup[alias_key] = canonical_key
+                canonical_aliases.setdefault(canonical_key, set()).add(alias_key)
+        
+        return canonical_labels, alias_lookup, canonical_aliases
+    
+    @staticmethod
+    def _load_income_categories_from_config() -> List[str]:
+        """
+        Load configured income categories for filtering income calculations.
+        
+        Returns:
+            List of normalized income category names.
+        """
+        try:
+            from config_manager import load_config  # Lazy import
+        except ImportError:
+            logger.debug("config_manager not available; skipping income category config.")
+            return []
+        
+        config = load_config()
+        categories = config.get("database", {}).get("income_categories", [])
+        if not isinstance(categories, list):
+            logger.warning("Config value 'income_categories' should be a list; ignoring.")
+            return []
+        
+        normalized = []
+        for raw in categories:
+            norm = BudgetManager._normalize_category(str(raw))
+            if norm:
+                normalized.append(norm.lower())
+        return normalized
+    
+    @staticmethod
+    def _show_projections_enabled() -> bool:
+        """Return True if projections should be displayed according to config."""
+        try:
+            from config_manager import load_config  # Lazy import
+        except ImportError:
+            return True
+        config = load_config()
+        return config.get("show_projections", True)
     
     @staticmethod
     def get_month_period(month: date) -> Tuple[date, date]:
@@ -289,48 +371,425 @@ class BudgetManager:
         """
         Calculate total spending for a category in a period.
         
-        Args:
-            category: Category name
-            period_start: Start date (defaults to start of current month)
-            period_end: End date (defaults to end of current month)
-        
-        Returns:
-            Total spending amount
+        Legacy wrapper retained for backward compatibility.
         """
         if period_start is None:
             period_start = date.today().replace(day=1)
         if period_end is None:
-            # Last day of current month
             next_month = period_start.replace(day=28) + timedelta(days=4)
             period_end = next_month - timedelta(days=next_month.day)
         
+        activity_map = self.get_activity_by_category(period_start, period_end, [category])
+        category_key = self._category_key(self._normalize_category(category))
+        return activity_map.get(category_key, 0.0)
+    
+    def get_activity_by_category(
+        self,
+        period_start: date,
+        period_end: date,
+        categories: Optional[List[str]] = None
+    ) -> Dict[str, float]:
+        """
+        Return absolute spending totals grouped by canonical category key for the period.
+        """
         session = self.db_manager.get_session()
         try:
-            normalized_category = self._normalize_category(category)
-            if not normalized_category:
-                return 0.0
-            category_key = self._category_key(normalized_category)
+            canonical_labels, alias_lookup, _ = self._load_budget_category_aliases()
             
             start_datetime = datetime.combine(period_start, datetime.min.time())
             end_datetime = datetime.combine(period_end, datetime.max.time())
             
-            # Sum negative amounts (spending) for this category
-            result = session.query(Transaction.amount).filter(
-                Transaction.category.isnot(None),
-                func.lower(Transaction.category) == category_key,
+            query = session.query(
+                func.lower(func.trim(Transaction.category)).label("category_key"),
+                func.sum(Transaction.amount).label("total")
+            ).filter(
                 Transaction.date >= start_datetime,
                 Transaction.date <= end_datetime,
-                Transaction.is_transfer == 0,  # Exclude transfers
-                Transaction.amount < 0  # Only spending (negative amounts)
-            ).all()
+                Transaction.is_transfer == 0,
+                Transaction.amount < 0
+            )
             
-            total = sum(abs(amount[0]) for amount in result) if result else 0.0
-            return total
-        except SQLAlchemyError as e:
-            logger.error(f"Failed to calculate category spending: {e}")
+            if categories:
+                category_keys = {
+                    self._category_key(self._normalize_category(cat))
+                    for cat in categories
+                    if self._normalize_category(cat)
+                }
+                mapped_keys = {alias_lookup.get(k, k) for k in category_keys}
+                include_keys = category_keys.union(mapped_keys)
+                if include_keys:
+                    query = query.filter(
+                        func.lower(func.trim(Transaction.category)).in_(include_keys)
+                    )
+            
+            results = query.group_by("category_key").all()
+            activity_map: Dict[str, float] = {}
+            for key, total in results:
+                if not key:
+                    continue
+                canonical_key = alias_lookup.get(key, key)
+                activity_map[canonical_key] = activity_map.get(canonical_key, 0.0) + abs(total or 0.0)
+            
+            # ensure canonical keys exist even if zero transactions
+            if categories:
+                for cat in categories:
+                    normalized = self._normalize_category(cat)
+                    canonical_key = alias_lookup.get(self._category_key(normalized), self._category_key(normalized))
+                    activity_map.setdefault(canonical_key, 0.0)
+            else:
+                for canonical_key in canonical_labels:
+                    activity_map.setdefault(canonical_key, 0.0)
+            
+            return activity_map
+        except SQLAlchemyError as exc:
+            logger.error("Failed to calculate activity by category: %s", exc)
+            return {}
+        finally:
+            session.close()
+    
+    def _apply_income_category_filter(self, query):
+        """Apply configured income categories to the provided query if defined."""
+        categories = self._load_income_categories_from_config()
+        if categories:
+            query = query.filter(
+                Transaction.category.isnot(None),
+                func.lower(Transaction.category).in_(categories)
+            )
+        return query
+    
+    def _sum_transactions(
+        self,
+        period_start: date,
+        period_end: date,
+        positive_only: bool = False,
+        negative_only: bool = False
+    ) -> float:
+        """
+        Sum transactions for the given period. Expenses are returned as positive values.
+        """
+        session = self.db_manager.get_session()
+        try:
+            start_datetime = datetime.combine(period_start, datetime.min.time())
+            end_datetime = datetime.combine(period_end, datetime.max.time())
+            
+            query = session.query(func.sum(Transaction.amount)).filter(
+                Transaction.date >= start_datetime,
+                Transaction.date <= end_datetime,
+                Transaction.is_transfer == 0
+            )
+            
+            if positive_only and negative_only:
+                raise ValueError("positive_only and negative_only cannot both be True")
+            
+            if positive_only:
+                query = query.filter(Transaction.amount > 0)
+                query = self._apply_income_category_filter(query)
+            elif negative_only:
+                query = query.filter(Transaction.amount < 0)
+            
+            total = query.scalar() or 0.0
+            if negative_only:
+                total = abs(total)
+            return float(total)
+        except SQLAlchemyError as exc:
+            logger.error("Failed to sum transactions: %s", exc)
             return 0.0
         finally:
             session.close()
+    
+    def get_income_override(self, period_start: date) -> Optional[IncomeOverride]:
+        """Return saved income override for the provided period, if any."""
+        session = self.db_manager.get_session()
+        try:
+            override = session.query(IncomeOverride).filter(
+                IncomeOverride.period_start == period_start
+            ).first()
+            if override:
+                session.expunge(override)
+            return override
+        except SQLAlchemyError as exc:
+            logger.error("Failed to fetch income override: %s", exc)
+            return None
+        finally:
+            session.close()
+    
+    def upsert_income_override(
+        self,
+        period_start: date,
+        period_end: date,
+        amount: float,
+        notes: Optional[str] = None
+    ) -> Optional[IncomeOverride]:
+        """Create or update a monthly income override."""
+        session = self.db_manager.get_session()
+        try:
+            override = session.query(IncomeOverride).filter(
+                IncomeOverride.period_start == period_start
+            ).first()
+            
+            if override:
+                override.override_amount = amount
+                override.period_end = period_end
+                override.notes = notes
+                override.updated_at = datetime.utcnow()
+            else:
+                override = IncomeOverride(
+                    period_start=period_start,
+                    period_end=period_end,
+                    override_amount=amount,
+                    notes=notes
+                )
+                session.add(override)
+            
+            session.commit()
+            session.refresh(override)
+            session.expunge(override)
+            logger.info("Income override saved for %s: %s", period_start, amount)
+            return override
+        except SQLAlchemyError as exc:
+            session.rollback()
+            logger.error("Failed to upsert income override: %s", exc)
+            return None
+        finally:
+            session.close()
+    
+    def delete_income_override(self, period_start: date) -> bool:
+        """Delete an existing income override for the given period."""
+        session = self.db_manager.get_session()
+        try:
+            deleted = session.query(IncomeOverride).filter(
+                IncomeOverride.period_start == period_start
+            ).delete()
+            if deleted:
+                session.commit()
+                logger.info("Income override cleared for %s", period_start)
+                return True
+            return False
+        except SQLAlchemyError as exc:
+            session.rollback()
+            logger.error("Failed to delete income override: %s", exc)
+            return False
+        finally:
+            session.close()
+    
+    def calculate_historical_income_average(
+        self,
+        period_start: date,
+        months: int = 3
+    ) -> float:
+        """
+        Calculate average income for the previous N full months.
+        """
+        totals: List[float] = []
+        month_start = period_start.replace(day=1)
+        
+        for _ in range(months):
+            prev_month_end = month_start - timedelta(days=1)
+            prev_month_start = prev_month_end.replace(day=1)
+            total = self._sum_transactions(prev_month_start, prev_month_end, positive_only=True)
+            if total > 0:
+                totals.append(total)
+            month_start = prev_month_start
+        
+        if not totals:
+            return 0.0
+        return sum(totals) / len(totals)
+    
+    def calculate_monthly_income(
+        self,
+        period_start: date,
+        period_end: date,
+        fallback_months: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Determine income for the month with override/historical fallback.
+        """
+        override = self.get_income_override(period_start)
+        if override:
+            return {
+                "amount": float(override.override_amount),
+                "source": "override",
+                "override": override
+            }
+        
+        actual = self._sum_transactions(period_start, period_end, positive_only=True)
+        if actual > 0:
+            return {"amount": actual, "source": "actual", "override": None}
+        
+        historical_avg = self.calculate_historical_income_average(period_start, fallback_months)
+        return {"amount": historical_avg, "source": "historical", "override": None}
+    
+    def get_account_balance_total(self) -> float:
+        """Return the sum of all account balances."""
+        session = self.db_manager.get_session()
+        try:
+            total = session.query(func.sum(Account.balance)).scalar() or 0.0
+            return float(total)
+        except SQLAlchemyError as exc:
+            logger.error("Failed to fetch account balances: %s", exc)
+            return 0.0
+        finally:
+            session.close()
+    
+    def calculate_daily_income_expense(
+        self,
+        period_start: date,
+        current_date: date
+    ) -> Dict[str, float]:
+        """
+        Calculate daily average income and expense for the month to date.
+        """
+        if current_date < period_start:
+            return {
+                "days_elapsed": 0,
+                "income_to_date": 0.0,
+                "spend_to_date": 0.0,
+                "avg_daily_income": 0.0,
+                "avg_daily_spend": 0.0
+            }
+        
+        income_to_date = self._sum_transactions(period_start, current_date, positive_only=True)
+        spend_to_date = self._sum_transactions(period_start, current_date, negative_only=True)
+        days_elapsed = (current_date - period_start).days + 1
+        days_elapsed = max(days_elapsed, 1)
+        
+        return {
+            "days_elapsed": days_elapsed,
+            "income_to_date": income_to_date,
+            "spend_to_date": spend_to_date,
+            "avg_daily_income": income_to_date / days_elapsed if days_elapsed else 0.0,
+            "avg_daily_spend": spend_to_date / days_elapsed if days_elapsed else 0.0
+        }
+    
+    @staticmethod
+    def calculate_unassigned(income: float, assigned: float) -> float:
+        """Return unassigned funds (income minus assigned)."""
+        return income - assigned
+    
+    @staticmethod
+    def calculate_projected_balance(
+        current_balances: float,
+        days_left: int,
+        avg_daily_income: float,
+        avg_daily_spend: float
+    ) -> float:
+        """Simple projection of end-of-month balance."""
+        return current_balances + days_left * (avg_daily_income - avg_daily_spend)
+    
+    @staticmethod
+    def get_health_tips(snapshot: Dict[str, Any]) -> List[str]:
+        """Generate budget tips based on snapshot metrics."""
+        tips: List[str] = []
+        if snapshot["unassigned_funds"] > 0:
+            tips.append("Allocate remaining unassigned dollars to savings or priority goals (YNAB Rule 1).")
+        elif snapshot["unassigned_funds"] < 0:
+            tips.append("You've over-assigned your income. Move money from lower-priority categories.")
+        
+        if snapshot["available_total"] < 0:
+            tips.append("Spending exceeds your assignments. Trim or move funds from other categories.")
+        elif snapshot["available_total"] == 0 and snapshot["assigned_total"] > 0:
+            tips.append("All assigned funds are spoken for—consider building a buffer for next month.")
+        
+        if snapshot["budget_utilization_pct"] >= 90:
+            tips.append("Budget utilization is high. Pause discretionary spending to stay on track.")
+        
+        projected = snapshot.get("projected_balance")
+        if projected is not None and projected < 0:
+            tips.append("Projected balance is negative. Boost income or cut spending to avoid a cash shortfall.")
+        
+        if not tips:
+            tips.append("Great job! Keep aging your money and planning for future expenses.")
+        return tips
+    
+    @staticmethod
+    def get_health_alerts(snapshot: Dict[str, Any]) -> List[str]:
+        """High-priority alerts derived from snapshot metrics."""
+        alerts: List[str] = []
+        if snapshot["unassigned_funds"] < 0:
+            alerts.append("Unassigned funds are negative—rebalance your budget to match income.")
+        if snapshot["available_total"] < 0:
+            alerts.append("Remaining available is negative—at least one category is overspent.")
+        projected = snapshot.get("projected_balance")
+        if projected is not None and projected < 0:
+            alerts.append("Projected end-of-month balance is negative.")
+        return alerts
+    
+    def build_financial_snapshot(
+        self,
+        period_start: date,
+        period_end: date,
+        active_budgets: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Aggregate metrics for the Financial Health Snapshot."""
+        assigned_total = sum(float(item.get("assigned", 0.0)) for item in active_budgets)
+        spent_total = sum(float(item.get("activity", 0.0)) for item in active_budgets)
+        available_total = sum(float(item.get("available", 0.0)) for item in active_budgets)
+        utilization_pct = (spent_total / assigned_total * 100.0) if assigned_total > 0 else 0.0
+        
+        income_info = self.calculate_monthly_income(period_start, period_end)
+        income_total = float(income_info["amount"])
+        unassigned = self.calculate_unassigned(income_total, assigned_total)
+        
+        today = date.today()
+        current_date = min(max(today, period_start), period_end)
+        days_in_period = (period_end - period_start).days + 1
+        days_left = max((period_end - current_date).days, 0)
+        
+        daily_stats = self.calculate_daily_income_expense(period_start, current_date)
+        show_projections = self._show_projections_enabled()
+        
+        if daily_stats["days_elapsed"] == 0:
+            avg_income = income_total / days_in_period if days_in_period else 0.0
+            avg_spend = spent_total / days_in_period if days_in_period else 0.0
+        else:
+            avg_income = daily_stats["avg_daily_income"]
+            avg_spend = daily_stats["avg_daily_spend"]
+            if avg_income == 0 and income_total > 0:
+                avg_income = income_total / daily_stats["days_elapsed"]
+        
+        if income_total == 0:
+            historical_avg_income = self.calculate_historical_income_average(period_start)
+            if historical_avg_income > 0 and days_in_period:
+                avg_income = max(avg_income, historical_avg_income / days_in_period)
+        
+        current_balances = self.get_account_balance_total()
+        projected_balance = None
+        if show_projections:
+            projected_balance = self.calculate_projected_balance(
+                current_balances=current_balances,
+                days_left=days_left,
+                avg_daily_income=avg_income,
+                avg_daily_spend=avg_spend
+            )
+        
+        snapshot_base = {
+            "unassigned_funds": unassigned,
+            "available_total": available_total,
+            "assigned_total": assigned_total,
+            "budget_utilization_pct": utilization_pct,
+            "projected_balance": projected_balance,
+        }
+        
+        snapshot = {
+            "income_total": income_total,
+            "income_source": income_info["source"],
+            "override": income_info["override"],
+            "assigned_total": assigned_total,
+            "spent_total": spent_total,
+            "available_total": available_total,
+            "unassigned_funds": unassigned,
+            "budget_utilization_pct": utilization_pct,
+            "current_balances": current_balances,
+            "avg_daily_income": avg_income,
+            "avg_daily_spend": avg_spend,
+            "days_left": days_left,
+            "days_in_period": days_in_period,
+            "projected_balance": projected_balance,
+            "alerts": self.get_health_alerts(snapshot_base),
+            "tips": self.get_health_tips(snapshot_base),
+            "show_projections": show_projections,
+        }
+        return snapshot
     
     def get_budget_status(
         self,
@@ -510,6 +969,8 @@ class BudgetManager:
         session = self.db_manager.get_session()
         
         try:
+            canonical_labels, alias_lookup, _ = self._load_budget_category_aliases()
+            
             raw_categories = session.query(
                 func.trim(Transaction.category)
             ).filter(
@@ -518,7 +979,7 @@ class BudgetManager:
                 Transaction.is_transfer == 0
             ).distinct().all()
             
-            unique: Dict[str, str] = {}
+            canonical_set: Dict[str, str] = {}
             for (category,) in raw_categories:
                 normalized = self._normalize_category(category)
                 if not normalized:
@@ -526,10 +987,15 @@ class BudgetManager:
                 key = self._category_key(normalized)
                 if key == "transfer":
                     continue
-                if key not in unique:
-                    unique[key] = normalized
+                canonical_key = alias_lookup.get(key, key)
+                if canonical_key not in canonical_set:
+                    canonical_set[canonical_key] = canonical_labels.get(canonical_key, normalized)
             
-            category_list = sorted(unique.values(), key=str.casefold)
+            # ensure canonical labels from config are included even without transactions
+            for canonical_key, label in canonical_labels.items():
+                canonical_set.setdefault(canonical_key, label)
+            
+            category_list = sorted(canonical_set.values(), key=str.casefold)
             logger.info(f"Found {len(category_list)} unique categories")
             return category_list
             
@@ -609,16 +1075,20 @@ class BudgetManager:
         Returns:
             Sorted list of available category names.
         """
+        _, alias_lookup, _ = self._load_budget_category_aliases()
         all_categories = categories if categories is not None else self.get_budget_categories()
         if not all_categories:
             return []
         
         existing_budgets = self.get_monthly_budgets(month)
-        existing_keys: Set[str] = {self._category_key(budget.category) for budget in existing_budgets}
+        existing_keys: Set[str] = {
+            alias_lookup.get(self._category_key(self._normalize_category(budget.category)), self._category_key(self._normalize_category(budget.category)))
+            for budget in existing_budgets
+        }
         
         available = [
             category for category in all_categories
-            if self._category_key(category) not in existing_keys
+            if alias_lookup.get(self._category_key(self._normalize_category(category)), self._category_key(self._normalize_category(category))) not in existing_keys
         ]
         return sorted(available, key=str.casefold)
     
@@ -664,21 +1134,33 @@ class BudgetManager:
         """
         budgets = self.get_monthly_budgets(month)
         overview: List[Dict[str, Any]] = []
+        if not budgets:
+            return overview
+        
+        period_start = budgets[0].period_start.date()
+        period_end = budgets[0].period_end.date()
+        canonical_labels, alias_lookup, _ = self._load_budget_category_aliases()
+        activity_map = self.get_activity_by_category(
+            period_start=period_start,
+            period_end=period_end,
+            categories=[budget.category for budget in budgets]
+        )
         
         for budget in budgets:
             period_start = budget.period_start.date()
             period_end = budget.period_end.date()
-            activity = self.calculate_category_spending(
-                budget.category,
-                period_start=period_start,
-                period_end=period_end
-            )
+            normalized = self._normalize_category(budget.category)
+            category_key = self._category_key(normalized)
+            canonical_key = alias_lookup.get(category_key, category_key)
+            display_label = canonical_labels.get(canonical_key, normalized)
+            activity = activity_map.get(canonical_key, 0.0)
             available = budget.allocated_amount - activity
             used_pct = (activity / budget.allocated_amount * 100) if budget.allocated_amount > 0 else 0.0
             
             overview.append({
                 "id": budget.id,
-                "category": budget.category,
+                "category": display_label,
+                "canonical_key": canonical_key,
                 "assigned": budget.allocated_amount,
                 "activity": activity,
                 "available": available,
@@ -688,6 +1170,64 @@ class BudgetManager:
             })
         
         return overview
+    
+    @staticmethod
+    def filter_budget_overview(
+        overview: List[Dict[str, Any]],
+        min_assigned: float = 0.0,
+        strict: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter budget overview entries by assigned amount.
+        
+        Args:
+            overview: List of budget overview dictionaries.
+            min_assigned: Threshold for assigned amount filtering.
+            strict: If True, require assigned > min_assigned; otherwise >=.
+        
+        Returns:
+            Filtered list of overview entries.
+        """
+        if not overview:
+            return []
+        
+        comparator = (lambda value: value > min_assigned) if strict else (lambda value: value >= min_assigned)
+        filtered = [entry for entry in overview if comparator(float(entry.get("assigned", 0.0)))]
+        
+        logger.debug(
+            "Filtered budget overview: %s -> %s entries (min_assigned=%s, strict=%s)",
+            len(overview),
+            len(filtered),
+            min_assigned,
+            strict
+        )
+        return filtered
+    
+    @staticmethod
+    def calculate_budget_summary(overview: List[Dict[str, Any]]) -> Dict[str, float]:
+        """
+        Calculate aggregate budget summary metrics from overview entries.
+        
+        Args:
+            overview: List of budget overview dictionaries.
+        
+        Returns:
+            Dictionary with total_assigned, total_activity, total_available, budget_used_pct.
+        """
+        total_assigned = sum(float(entry.get("assigned", 0.0)) for entry in overview)
+        total_activity = sum(float(entry.get("activity", 0.0)) for entry in overview)
+        total_available = sum(float(entry.get("available", 0.0)) for entry in overview)
+        budget_used_pct = (total_activity / total_assigned * 100.0) if total_assigned > 0 else 0.0
+        
+        summary = {
+            "total_assigned": total_assigned,
+            "total_activity": total_activity,
+            "total_available": total_available,
+            "budget_used_pct": budget_used_pct
+        }
+        
+        logger.debug("Budget summary calculated: %s", summary)
+        return summary
     
     def upsert_monthly_budget(self, category: str, month: date, allocated_amount: float) -> Optional[Budget]:
         """

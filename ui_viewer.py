@@ -13,6 +13,7 @@ import pandas as pd
 
 from data_viewer import DataViewer
 from database_ops import DatabaseManager
+from utils import ensure_data_dir, resolve_connection_string
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -38,30 +39,17 @@ def get_connection_string() -> str:
     Returns:
         Database connection string
     """
-    import os
     import yaml
     from pathlib import Path
     
-    # Try environment variable first
-    conn_str = os.environ.get("DB_CONNECTION_STRING")
-    if conn_str:
-        return conn_str
-    
-    # Fall back to config file
     config_path = Path("config.yaml")
+    config = {}
     if config_path.exists():
         with open(config_path) as f:
-            config = yaml.safe_load(f)
-        db_config = config.get("database", {})
-        if "connection_string" in db_config:
-            return db_config["connection_string"]
-        db_type = db_config.get("type", "sqlite")
-        db_path = db_config.get("path", "transactions.db")
-        if db_type == "sqlite":
-            return f"sqlite:///{db_path}"
+            config = yaml.safe_load(f) or {}
     
-    # Default fallback
-    return "sqlite:///transactions.db"
+    ensure_data_dir(config)
+    return resolve_connection_string(config)
 
 
 def main_ui_viewer(connection_string: Optional[str] = None) -> None:

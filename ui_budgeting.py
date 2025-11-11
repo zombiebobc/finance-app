@@ -58,9 +58,14 @@ def render_budget_dashboard(db_manager: DatabaseManager):
     # Session state for add/edit flows
     if "budget_add_mode" not in st.session_state:
         st.session_state.budget_add_mode = False
-    if "budget_add_category" not in st.session_state:
-        st.session_state.budget_add_category = None
     if "budget_add_amount" not in st.session_state:
+        st.session_state.budget_add_amount = 0.0
+    
+    def reset_add_form_state(clear_mode: bool = False) -> None:
+        """Reset temporary session state keys used by the add budget form."""
+        if clear_mode:
+            st.session_state.budget_add_mode = False
+        st.session_state.pop("budget_add_category", None)
         st.session_state.budget_add_amount = 0.0
     
     # Month selector
@@ -80,6 +85,12 @@ def render_budget_dashboard(db_manager: DatabaseManager):
     # Fetch existing budgets and category lists
     all_categories = budget_manager.get_budget_categories()
     budget_overview = budget_manager.get_budget_overview(selected_month)
+    active_budgets = budget_manager.filter_budget_overview(
+        budget_overview,
+        min_assigned=0.0,
+        strict=True
+    )
+    summary = budget_manager.calculate_budget_summary(active_budgets)
     available_categories = budget_manager.get_available_categories_for_month(
         selected_month,
         categories=all_categories
@@ -97,9 +108,8 @@ def render_budget_dashboard(db_manager: DatabaseManager):
         )
         
         if add_button_clicked:
+            reset_add_form_state(clear_mode=True)
             st.session_state.budget_add_mode = True
-            st.session_state.budget_add_category = None
-            st.session_state.budget_add_amount = 0.0
         
         if add_disabled:
             if not all_categories:
@@ -144,17 +154,13 @@ def render_budget_dashboard(db_manager: DatabaseManager):
                         )
                         if result:
                             st.success(f"Budget for **{category_selection}** saved.")
-                            st.session_state.budget_add_mode = False
-                            st.session_state.budget_add_category = None
-                            st.session_state.budget_add_amount = 0.0
+                            reset_add_form_state(clear_mode=True)
                             st.rerun()
                         else:
                             st.error("Failed to save budget. Please try again.")
             with add_actions[1]:
                 if st.button("Cancel", key="cancel_new_budget"):
-                    st.session_state.budget_add_mode = False
-                    st.session_state.budget_add_category = None
-                    st.session_state.budget_add_amount = 0.0
+                    reset_add_form_state(clear_mode=True)
                     st.rerun()
     
     st.markdown("---")
@@ -163,32 +169,157 @@ def render_budget_dashboard(db_manager: DatabaseManager):
         st.info("No budget categories added yet. Click '+ Add Budget Category' to start.")
         return
     
-    budget_df = pd.DataFrame(budget_overview)
+    active_df = pd.DataFrame(active_budgets)
+    if "canonical_key" in active_df.columns:
+        active_df = active_df.drop(columns=["canonical_key"])
+    snapshot = budget_manager.build_financial_snapshot(period_start, period_end, active_budgets)
+    income_override = snapshot.get("override")
     
-    # Summary metrics
-    total_assigned = float(budget_df["assigned"].sum())
-    total_activity = float(budget_df["activity"].sum())
-    total_available = float(budget_df["available"].sum())
-    total_pct_used = (total_activity / total_assigned * 100) if total_assigned > 0 else 0.0
+    def _value_color(value: float) -> str:
+        if value > 0:
+            return "#2ecc71"
+        if value < 0:
+            return "#e74c3c"
+        return "#f1c40f"
     
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Assigned", format_currency(total_assigned))
-    with col2:
-        st.metric("Total Activity", format_currency(total_activity))
-    with col3:
-        availability_color = "normal" if total_available >= 0 else "inverse"
+    st.markdown("### **Financial Health Snapshot**")
+    metric_cols = st.columns(3)
+    
+    income_label = "Total Monthly Income"
+    income_caption = f"Source: {snapshot['income_source'].capitalize()}"
+    with metric_cols[0]:
         st.metric(
-            "Total Available",
-            format_currency(total_available),
-            delta=None,
-            delta_color=availability_color
+            income_label,
+            format_currency(snapshot["income_total"]),
+            help="Expected income for the selected month. Override below if needed."
         )
-    with col4:
-        st.metric("Budget Used", f"{total_pct_used:.1f}%")
+        st.caption(income_caption)
+    
+    with metric_cols[1]:
+        st.metric(
+            "Assigned to Budgets",
+            format_currency(snapshot["assigned_total"]),
+            help="Sum of all category assignments. Every dollar should have a job."
+        )
+    
+    unassigned_color = _value_color(snapshot["unassigned_funds"])
+    with metric_cols[2]:
+        st.markdown(
+            f"<div style='font-size:0.9rem; font-weight:600;'>Unassigned Funds</div>"
+            f"<div style='font-size:1.6rem; font-weight:700; color:{unassigned_color};'>"
+            f"{format_currency(snapshot['unassigned_funds'])}</div>",
+            unsafe_allow_html=True
+        )
+        st.caption("Assign remaining funds to categories (YNAB Rule 1).")
+    
+    metric_cols_row2 = st.columns(3)
+    with metric_cols_row2[0]:
+        st.metric(
+            "Current Spent",
+            format_currency(snapshot["spent_total"]),
+            help="Actual expenses recorded in transactions for the selected month."
+        )
+    
+    available_color = _value_color(snapshot["available_total"])
+    with metric_cols_row2[1]:
+        st.markdown(
+            f"<div style='font-size:0.9rem; font-weight:600;'>Remaining Available</div>"
+            f"<div style='font-size:1.6rem; font-weight:700; color:{available_color};'>"
+            f"{format_currency(snapshot['available_total'])}</div>",
+            unsafe_allow_html=True
+        )
+        st.caption("Assigned minus spent. Stay green to keep categories on track.")
+    
+    utilization = snapshot["budget_utilization_pct"]
+    with metric_cols_row2[2]:
+        st.metric(
+            "Budget Utilization %",
+            f"{utilization:.1f}%",
+            help="How much of assigned funds have been used so far."
+        )
+        st.progress(min(utilization / 100.0, 1.0))
+    
+    projection_cols = st.columns(2)
+    if snapshot["show_projections"]:
+        with projection_cols[0]:
+            projected_color = _value_color(snapshot.get("projected_balance") or 0.0)
+            proj_value = snapshot.get("projected_balance")
+            if proj_value is not None:
+                st.markdown(
+                    f"<div style='font-size:0.9rem; font-weight:600;'>Projected End-of-Month Balance</div>"
+                    f"<div style='font-size:1.6rem; font-weight:700; color:{projected_color};'>"
+                    f"{format_currency(proj_value)}</div>",
+                    unsafe_allow_html=True
+                )
+                st.caption(
+                    f"Days left: {snapshot['days_left']}. Projection assumes linear trend from average daily income/spend."
+                )
+    else:
+        with projection_cols[0]:
+            st.info("Projections disabled in configuration.")
+    
+    income_state_key = f"income_override_value_{selected_month.strftime('%Y%m')}"
+    default_income_value = income_override.override_amount if income_override else snapshot["income_total"]
+    if income_state_key not in st.session_state:
+        st.session_state[income_state_key] = float(default_income_value)
+    
+    override_cols = st.columns([3, 1, 1])
+    with override_cols[0]:
+        override_value = st.number_input(
+            "Expected Monthly Income Override",
+            min_value=0.0,
+            value=st.session_state[income_state_key],
+            format="%.2f",
+            help="Adjust the expected income for planning purposes.",
+            key=income_state_key
+        )
+    with override_cols[1]:
+        if st.button("Save Income", key=f"save_income_override_{selected_month.strftime('%Y%m')}"):
+            result = budget_manager.upsert_income_override(
+                period_start=period_start,
+                period_end=period_end,
+                amount=float(override_value)
+            )
+            if result:
+                st.success("Income override saved.")
+                st.session_state.pop(income_state_key, None)
+                st.rerun()
+            else:
+                st.error("Failed to save income override.")
+    with override_cols[2]:
+        if income_override and st.button("Clear Override", key=f"clear_income_override_{selected_month.strftime('%Y%m')}"):
+            if budget_manager.delete_income_override(period_start):
+                st.success("Income override cleared.")
+                st.session_state.pop(income_state_key, None)
+                st.rerun()
+            else:
+                st.error("Failed to clear override.")
+    
+    if snapshot["alerts"]:
+        for alert in snapshot["alerts"]:
+            st.error(alert)
+    
+    with st.expander("💡 Budget Tips"):
+        for tip in snapshot["tips"]:
+            st.markdown(f"- {tip}")
     
     st.markdown("---")
     st.subheader("Category Budgets")
+    
+    sort_options = [
+        "Assigned (High → Low)",
+        "Alphabetical (A → Z)",
+        "Available (Low → High)",
+        "Original Order"
+    ]
+    sort_choice = st.selectbox(
+        "Sort categories by",
+        sort_options,
+        index=0,
+        help="Choose how to order your budget categories."
+    )
+    if st.button("Refresh Data", key="refresh_budget_data"):
+        st.rerun()
     
     def _availability_color(value: float) -> str:
         if value > 0:
@@ -203,8 +334,22 @@ def render_budget_dashboard(db_manager: DatabaseManager):
         if percentage >= 90:
             return "#f1c40f"  # yellow
         return "#2ecc71"      # green
+    if not active_budgets:
+        st.info("No budgeted categories for this month. Use '+ Add Budget Category' to start.")
+        return
     
-    for budget in budget_overview:
+    if sort_choice == "Assigned (High → Low)":
+        sorted_budgets = sorted(active_budgets, key=lambda item: float(item["assigned"]), reverse=True)
+    elif sort_choice == "Alphabetical (A → Z)":
+        sorted_budgets = sorted(active_budgets, key=lambda item: item["category"])
+    elif sort_choice == "Available (Low → High)":
+        sorted_budgets = sorted(active_budgets, key=lambda item: float(item["available"]))
+    else:
+        sorted_budgets = active_budgets
+    
+    pending_delete_key = f"pending_delete_{selected_month.strftime('%Y%m')}"
+    
+    for budget in sorted_budgets:
         st.markdown(
             f"#### {budget['category']} "
             f"<span style='font-size:0.9rem; color:#7f8c8d;'>({format_currency(budget['assigned'])} assigned)</span>",
@@ -226,7 +371,7 @@ def render_budget_dashboard(db_manager: DatabaseManager):
         
         with row_cols[1]:
             st.markdown(f"<div style='font-weight:600;'>{format_currency(budget['activity'])}</div>", unsafe_allow_html=True)
-            st.caption("Activity (Spent)")
+            st.caption("Current Spent (auto-calculated from this month's transactions)")
         
         available_value = float(budget["available"])
         with row_cols[2]:
@@ -270,6 +415,24 @@ def render_budget_dashboard(db_manager: DatabaseManager):
                         st.rerun()
                     else:
                         st.error("Failed to update budget. Please try again.")
+            delete_button_key = f"delete_budget_{budget['id']}"
+            if st.button("Delete", key=delete_button_key, type="secondary"):
+                st.session_state[pending_delete_key] = budget["id"]
+        
+        if st.session_state.get(pending_delete_key) == budget["id"]:
+            st.warning(f"Confirm deleting budget for {budget['category']}?")
+            confirm_cols = st.columns(2)
+            with confirm_cols[0]:
+                if st.button("Confirm Delete", key=f"confirm_delete_{budget['id']}", type="primary"):
+                    if budget_manager.delete_budget(budget["id"]):
+                        st.success(f"Budget deleted for {budget['category']}.")
+                        st.session_state.pop(pending_delete_key, None)
+                        st.rerun()
+                    else:
+                        st.error("Failed to delete budget.")
+            with confirm_cols[1]:
+                if st.button("Cancel", key=f"cancel_delete_{budget['id']}"):
+                    st.session_state.pop(pending_delete_key, None)
         
         st.markdown(
             "<hr style='margin-top:0.5rem; margin-bottom:1.5rem; opacity:0.2;'>",
@@ -277,7 +440,7 @@ def render_budget_dashboard(db_manager: DatabaseManager):
         )
     
     with st.expander("View Budget Table"):
-        table_df = budget_df.copy()
+        table_df = active_df.copy()
         table_df["Assigned"] = table_df["assigned"].apply(format_currency)
         table_df["Activity"] = table_df["activity"].apply(format_currency)
         table_df["Available"] = table_df["available"].apply(format_currency)
