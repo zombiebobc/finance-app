@@ -6,8 +6,9 @@ using SQLAlchemy ORM. Supports SQLite by default with easy migration to other da
 """
 
 import logging
+import sqlite3
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Iterable, Tuple
 from pathlib import Path
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Date, Index, ForeignKey, Enum
@@ -18,6 +19,11 @@ import enum
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+class DatabaseError(Exception):
+    """Custom exception type for sqlite3 database operations."""
+
 
 # Base class for declarative models
 Base = declarative_base()
@@ -684,4 +690,414 @@ class DatabaseManager:
         if hasattr(self, 'engine'):
             self.engine.dispose()
             logger.info("Database connection closed")
+
+
+def _configure_sqlite_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Configure sqlite connection defaults."""
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_sqlite_connection(
+    db_path: str | Path,
+    *,
+    read_only: bool = False,
+    detect_types: bool = True,
+    isolation_level: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Create and return a SQLite connection with sane defaults."""
+    if isinstance(db_path, Path):
+        raw_path = db_path
+    else:
+        raw_path = Path(db_path)
+
+    if str(raw_path) == ":memory:":
+        conn = sqlite3.connect(
+            ":memory:",
+            detect_types=sqlite3.PARSE_DECLTYPES if detect_types else 0,
+            isolation_level=isolation_level,
+            check_same_thread=False,
+        )
+        logger.debug("Opened in-memory SQLite connection.")
+        return _configure_sqlite_connection(conn)
+
+    path = raw_path
+    if read_only:
+        uri = f"file:{path.as_posix()}?mode=ro"
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            detect_types=sqlite3.PARSE_DECLTYPES if detect_types else 0,
+            isolation_level=isolation_level,
+            check_same_thread=False,
+        )
+    else:
+        conn = sqlite3.connect(
+            path,
+            detect_types=sqlite3.PARSE_DECLTYPES if detect_types else 0,
+            isolation_level=isolation_level,
+            check_same_thread=False,
+        )
+
+    logger.debug("Opened SQLite connection to %s (read_only=%s)", path, read_only)
+    return _configure_sqlite_connection(conn)
+
+
+def init_sqlite_db(conn: sqlite3.Connection) -> None:
+    """Initialize database tables and indexes for SQLite usage."""
+    schema_statements: Tuple[Tuple[str, Tuple[Any, ...]], ...] = (
+        (
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                type TEXT NOT NULL,
+                balance REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            (),
+        ),
+        (
+            """
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                description TEXT NOT NULL,
+                amount REAL NOT NULL,
+                category TEXT,
+                account TEXT,
+                account_id INTEGER,
+                source_file TEXT NOT NULL,
+                import_timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                duplicate_hash TEXT NOT NULL UNIQUE,
+                is_transfer INTEGER NOT NULL DEFAULT 0,
+                transfer_to_account_id INTEGER,
+                FOREIGN KEY(account_id) REFERENCES accounts(id),
+                FOREIGN KEY(transfer_to_account_id) REFERENCES accounts(id)
+            )
+            """,
+            (),
+        ),
+        (
+            """
+            CREATE TABLE IF NOT EXISTS budgets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                allocated_amount REAL NOT NULL DEFAULT 0.0,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            (),
+        ),
+        (
+            """
+            CREATE TABLE IF NOT EXISTS income_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period_start TEXT NOT NULL UNIQUE,
+                period_end TEXT NOT NULL,
+                override_amount REAL NOT NULL,
+                notes TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            (),
+        ),
+        (
+            """
+            CREATE TABLE IF NOT EXISTS balance_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                override_date TEXT NOT NULL,
+                override_balance REAL NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT,
+                FOREIGN KEY(account_id) REFERENCES accounts(id)
+            )
+            """,
+            (),
+        ),
+        (
+            # Fixed: Added index to improve transaction lookup by date.
+            "CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date)",
+            (),
+        ),
+        (
+            # Fixed: Added index to improve transaction lookup by account/date.
+            "CREATE INDEX IF NOT EXISTS idx_transactions_account_date ON transactions(account_id, date)",
+            (),
+        ),
+        (
+            # Fixed: Added index to accelerate duplicate hash lookups.
+            "CREATE INDEX IF NOT EXISTS idx_transactions_duplicate_hash ON transactions(duplicate_hash)",
+            (),
+        ),
+    )
+
+    try:
+        with conn:
+            for statement, params in schema_statements:
+                conn.execute(statement, params)
+        logger.info("SQLite schema initialized successfully.")
+    except sqlite3.Error as exc:
+        logger.exception("Failed to initialize SQLite schema.")
+        raise DatabaseError("Failed to initialize database schema.") from exc
+
+
+def insert_transaction_sqlite(conn: sqlite3.Connection, transaction_data: Dict[str, Any]) -> int:
+    """Insert a single transaction using parameterized queries."""
+    required_fields = ("date", "description", "amount", "source_file", "duplicate_hash")
+    missing = [field for field in required_fields if field not in transaction_data]
+    if missing:
+        raise DatabaseError(f"Missing required transaction fields: {', '.join(missing)}")
+
+    try:
+        with conn:
+            cursor = conn.execute(
+                # Fixed: Parameterized query prevents SQL injection.
+                """
+                INSERT INTO transactions (
+                    date,
+                    description,
+                    amount,
+                    category,
+                    account,
+                    account_id,
+                    source_file,
+                    import_timestamp,
+                    duplicate_hash,
+                    is_transfer,
+                    transfer_to_account_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?)
+                """,
+                (
+                    transaction_data["date"],
+                    transaction_data["description"],
+                    transaction_data["amount"],
+                    transaction_data.get("category"),
+                    transaction_data.get("account"),
+                    transaction_data.get("account_id"),
+                    transaction_data["source_file"],
+                    transaction_data.get("import_timestamp"),
+                    transaction_data["duplicate_hash"],
+                    transaction_data.get("is_transfer", 0),
+                    transaction_data.get("transfer_to_account_id"),
+                ),
+            )
+        logger.debug("Inserted transaction with duplicate_hash=%s", transaction_data["duplicate_hash"])
+        return int(cursor.lastrowid)
+    except sqlite3.IntegrityError as exc:
+        logger.warning("Integrity error inserting transaction: %s", exc)
+        raise DatabaseError("Transaction violates database constraints.") from exc
+    except sqlite3.Error as exc:
+        logger.exception("Unexpected SQLite error inserting transaction.")
+        raise DatabaseError("Failed to insert transaction.") from exc
+
+
+def bulk_insert_transactions_sqlite(
+    conn: sqlite3.Connection,
+    transactions: Iterable[Dict[str, Any]],
+) -> Tuple[int, int]:
+    """Bulk insert transactions with parameterized executemany calls."""
+    to_insert: List[Tuple[Any, ...]] = []
+    skipped = 0
+
+    for transaction in transactions:
+        try:
+            required_tuple = (
+                transaction["date"],
+                transaction["description"],
+                transaction["amount"],
+                transaction.get("category"),
+                transaction.get("account"),
+                transaction.get("account_id"),
+                transaction["source_file"],
+                transaction.get("import_timestamp"),
+                transaction["duplicate_hash"],
+                transaction.get("is_transfer", 0),
+                transaction.get("transfer_to_account_id"),
+            )
+            to_insert.append(required_tuple)
+        except KeyError as exc:
+            skipped += 1
+            logger.warning("Skipping transaction missing field %s", exc)
+
+    if not to_insert:
+        return 0, skipped
+
+    try:
+        with conn:
+            conn.executemany(
+                # Fixed: Parameterized query across executemany prevents SQL injection.
+                """
+                INSERT INTO transactions (
+                    date,
+                    description,
+                    amount,
+                    category,
+                    account,
+                    account_id,
+                    source_file,
+                    import_timestamp,
+                    duplicate_hash,
+                    is_transfer,
+                    transfer_to_account_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?)
+                """,
+                to_insert,
+            )
+        logger.info("Bulk inserted %d transactions (skipped=%d).", len(to_insert), skipped)
+        return len(to_insert), skipped
+    except sqlite3.IntegrityError as exc:
+        logger.warning("Integrity error bulk inserting transactions: %s", exc)
+        raise DatabaseError("One or more transactions violate database constraints.") from exc
+    except sqlite3.Error as exc:
+        logger.exception("Unexpected SQLite error during bulk insert.")
+        raise DatabaseError("Failed to bulk insert transactions.") from exc
+
+
+def query_transactions_sqlite(
+    conn: sqlite3.Connection,
+    filters: Optional[Dict[str, Any]] = None,
+    *,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    order_by: str = "date",
+    order_desc: bool = True,
+) -> List[Dict[str, Any]]:
+    """Query transactions with parameterized filters."""
+    valid_order_columns = {
+        "date",
+        "amount",
+        "description",
+        "category",
+        "account_id",
+        "import_timestamp",
+    }
+    if order_by not in valid_order_columns:
+        logger.debug("Invalid order_by '%s'; defaulting to 'date'.", order_by)
+        order_by = "date"
+
+    base_query = [
+        """
+        SELECT
+            id,
+            date,
+            description,
+            amount,
+            category,
+            account,
+            account_id,
+            source_file,
+            import_timestamp,
+            duplicate_hash,
+            is_transfer,
+            transfer_to_account_id
+        FROM transactions
+        """
+    ]
+
+    params: List[Any] = []
+    conditions: List[str] = []
+    filters = filters or {}
+
+    if filters.get("date_start"):
+        conditions.append("date >= ?")
+        params.append(filters["date_start"])
+    if filters.get("date_end"):
+        conditions.append("date <= ?")
+        params.append(filters["date_end"])
+    if filters.get("amount_min") is not None:
+        conditions.append("amount >= ?")
+        params.append(filters["amount_min"])
+    if filters.get("amount_max") is not None:
+        conditions.append("amount <= ?")
+        params.append(filters["amount_max"])
+    if filters.get("category"):
+        conditions.append("LOWER(category) LIKE LOWER(?)")
+        params.append(f"%{filters['category']}%")
+    if filters.get("description_keywords"):
+        keywords = filters["description_keywords"]
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        keyword_conditions = ["LOWER(description) LIKE LOWER(?)" for _ in keywords]
+        conditions.append(f"({' OR '.join(keyword_conditions)})")
+        params.extend([f"%{kw}%" for kw in keywords])
+    if filters.get("account_id") is not None:
+        conditions.append("account_id = ?")
+        params.append(filters["account_id"])
+    if filters.get("is_transfer") is not None:
+        conditions.append("is_transfer = ?")
+        params.append(1 if filters["is_transfer"] else 0)
+
+    if conditions:
+        base_query.append("WHERE " + " AND ".join(conditions))
+
+    direction = "DESC" if order_desc else "ASC"
+    base_query.append(f"ORDER BY {order_by} {direction}")
+
+    if limit is not None:
+        base_query.append("LIMIT ?")
+        params.append(limit)
+        if offset is not None:
+            base_query.append("OFFSET ?")
+            params.append(offset)
+    elif offset is not None:
+        base_query.append("LIMIT -1 OFFSET ?")
+        params.append(offset)
+
+    final_query = "\n".join(base_query)
+
+    try:
+        cursor = conn.execute(
+            # Fixed: Parameterized query for transaction lookup.
+            final_query,
+            params,
+        )
+        rows = cursor.fetchall()
+        logger.debug("Retrieved %d rows via SQLite query.", len(rows))
+        return [dict(row) for row in rows]
+    except sqlite3.Error as exc:
+        logger.exception("Failed to query transactions via SQLite.")
+        raise DatabaseError("Failed to retrieve transactions.") from exc
+
+
+def delete_transaction_sqlite(conn: sqlite3.Connection, transaction_id: int) -> None:
+    """Delete a transaction safely using parameterized queries."""
+    try:
+        with conn:
+            conn.execute(
+                # Fixed: Parameterized query for safe deletion.
+                "DELETE FROM transactions WHERE id = ?",
+                (transaction_id,),
+            )
+        logger.debug("Deleted transaction id=%s", transaction_id)
+    except sqlite3.Error as exc:
+        logger.exception("Failed to delete transaction id=%s", transaction_id)
+        raise DatabaseError("Failed to delete transaction.") from exc
+
+
+def get_transaction_count_sqlite(conn: sqlite3.Connection) -> int:
+    """Return the count of transactions using a parameterized query."""
+    try:
+        cursor = conn.execute(
+            # Fixed: Parameterized query to guard against injection.
+            "SELECT COUNT(*) AS total FROM transactions",
+            (),
+        )
+        row = cursor.fetchone()
+        total = int(row["total"]) if row else 0
+        logger.debug("Transaction count via SQLite: %d", total)
+        return total
+    except sqlite3.Error as exc:
+        logger.exception("Failed to count transactions via SQLite.")
+        raise DatabaseError("Failed to count transactions.") from exc
+
 

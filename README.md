@@ -984,7 +984,7 @@ The application is organized into modular components:
 - **`data_ingestion.py`**: Reads CSV files and handles format detection
 - **`data_standardization.py`**: Maps columns and standardizes data types/formats
 - **`duplicate_detection.py`**: Generates unique hashes and detects duplicates
-- **`database_ops.py`**: Manages database connections and operations (includes query functions)
+- **`database_ops.py`**: Manages database connections and operations (includes query functions). _Now hardened with parameterized `sqlite3` queries, centralized `DatabaseError` handling, and new indexes on `date`, `account_id`, and `duplicate_hash` to improve security and performance._
 - **`main.py`**: Orchestrates the import and view processes
 
 ### Viewer Components
