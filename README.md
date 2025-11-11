@@ -25,15 +25,31 @@ A modular Python application for importing financial transaction data from CSV f
 - **Account Filtering**: View transactions filtered by account
 
 ### Budgeting Features (YNAB-like)
-- **Interactive Budget Dashboard**: Web-based UI for easy budget management
-- **Monthly Budget View**: See all categories with assigned amounts, spending activity, and available balances
-- **Editable Assignments**: Update budget amounts directly in the UI with auto-save
+- **Interactive Budget Dashboard**: Web-based UI with opt-in category budgets and real-time updates
+- **Opt-in Category Budgets**: Start empty and add categories via a searchable “+ Add Budget Category” workflow
+- **Monthly Budget View**: Track assigned, activity, available, and usage percentage for the selected month
+- **Editable Assignments**: Update assigned amounts inline with validation and instant feedback
 - **Budget Envelopes**: Allocate funds to categories with budget periods
 - **Spending Tracking**: Track spending against allocated budgets with real-time updates
 - **Budget Status**: View remaining budget, percentage used, and over/under-budget alerts
 - **Color-coded Indicators**: Green for categories with budget remaining, red for overspending
 - **Period-based Budgets**: Set budgets for specific time periods (monthly, quarterly, etc.)
 - **YNAB Principles**: Built-in tips following the 4 YNAB rules
+
+#### Using the Budget Dashboard
+
+1. Open the **Budget** tab in the Streamlit analytics app and choose the month you want to budget.
+2. Click **+ Add Budget Category** to open a searchable dropdown of categories detected from your transactions (transfers are excluded).  
+   - If you have no historical data yet, you can define a fallback list via `budget_categories` in `config.yaml`.
+3. Enter the **Assigned Amount** (non-negative) and save to create or update the budget envelope for that month.
+4. Review the dynamic budget list:
+   - **Assigned** values are editable inline—adjust the number input and press **Save** to persist changes.
+   - **Activity (Spent)** updates in real time based on transactions for the selected month.
+   - **Available** is color-coded (green > 0, yellow = 0, red < 0) for quick status checks.
+   - **Budget Used %** highlights spending progress (warning above 90%, red when overspent).
+5. Expand the **View Budget Table** panel to export a tabular view for analysis or CSV export via Streamlit.
+
+Budgets are saved per month using the first and last day of the selected month. The design is extensible, enabling additional period types in future updates.
 
 ### Viewing Features
 - **Command-Line Viewer**: Query and filter transactions from the terminal
@@ -92,6 +108,7 @@ The application uses `config.yaml` for configuration. Key settings include:
 - **Duplicate Detection**: Configures which fields are used for duplicate detection
 - **Processing**: Chunk size, date formats, and decimal precision settings
 - **Logging**: Log level and output file settings
+- **Budget Categories** *(optional)*: Define a `budget_categories` list to seed the budget dropdown when no transaction history is available
 
 See `config.yaml` for detailed configuration options and examples.
 

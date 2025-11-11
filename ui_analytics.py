@@ -550,7 +550,7 @@ def main_ui_analytics():
             render_overview(analytics, report_gen, time_frame, account_id, time_frame_label, include_transfers)
         
         elif report_type == "Budget":
-            render_budget(db_manager)
+            render_budget_tab(db_manager)
         
         elif report_type == "Spending Categories":
             render_categories(analytics, report_gen, time_frame, account_id, time_frame_label, include_transfers)
@@ -1826,7 +1826,7 @@ def render_comparison(analytics, report_gen):
     st.dataframe(df_display, use_container_width=True, hide_index=True)
 
 
-def render_budget(db_manager):
+def render_budget_tab(db_manager):
     """Render YNAB-style budget dashboard."""
     from ui_budgeting import render_budget_dashboard
     

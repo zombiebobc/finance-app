@@ -54,7 +54,14 @@ def render_budget_dashboard(db_manager: DatabaseManager):
     
     # Initialize managers
     budget_manager = BudgetManager(db_manager)
-    analytics_engine = AnalyticsEngine(db_manager)
+    
+    # Session state for add/edit flows
+    if "budget_add_mode" not in st.session_state:
+        st.session_state.budget_add_mode = False
+    if "budget_add_category" not in st.session_state:
+        st.session_state.budget_add_category = None
+    if "budget_add_amount" not in st.session_state:
+        st.session_state.budget_add_amount = 0.0
     
     # Month selector
     months = get_month_options()
@@ -66,182 +73,221 @@ def render_budget_dashboard(db_manager: DatabaseManager):
         help="Choose the month to view/edit budgets"
     )
     selected_month = months[selected_month_label]
+    period_start, period_end = BudgetManager.get_month_period(selected_month)
     
-    # Get all categories from transactions
-    categories = budget_manager.get_all_categories_from_transactions()
+    st.caption(f"Budget period: {period_start.strftime('%b %d, %Y')} — {period_end.strftime('%b %d, %Y')}")
     
-    if not categories:
-        st.warning("No transaction categories found. Import transactions first!")
-        return
-    
-    # Get or create budgets for all categories
-    budget_data = []
-    
-    for category in categories:
-        # Get or create budget for this month
-        budget = budget_manager.get_or_create_monthly_budget(
-            category=category,
-            month=selected_month,
-            allocated_amount=0.0
-        )
-        
-        if budget:
-            # Calculate spending for this category
-            period_start = budget.period_start.date()
-            period_end = budget.period_end.date()
-            activity = budget_manager.calculate_category_spending(
-                category=category,
-                start_date=period_start,
-                end_date=period_end
-            )
-            
-            # Calculate available (assigned - spent)
-            available = budget.allocated_amount - activity
-            
-            budget_data.append({
-                'id': budget.id,
-                'Category': category,
-                'Assigned': budget.allocated_amount,
-                'Activity': activity,
-                'Available': available
-            })
-    
-    if not budget_data:
-        st.info("No budgets found. Start by assigning amounts to categories!")
-        return
-    
-    # Create DataFrame
-    df = pd.DataFrame(budget_data)
-    
-    # Display summary metrics
-    col1, col2, col3, col4 = st.columns(4)
-    
-    total_assigned = df['Assigned'].sum()
-    total_activity = df['Activity'].sum()
-    total_available = df['Available'].sum()
-    
-    with col1:
-        st.metric("Total Assigned", format_currency(total_assigned))
-    
-    with col2:
-        st.metric("Total Spent", format_currency(total_activity), 
-                  delta=format_currency(total_activity), delta_color="inverse")
-    
-    with col3:
-        st.metric("Total Available", format_currency(total_available),
-                  delta=format_currency(total_available), 
-                  delta_color="normal" if total_available >= 0 else "inverse")
-    
-    with col4:
-        # Calculate percentage used
-        pct_used = (total_activity / total_assigned * 100) if total_assigned > 0 else 0
-        st.metric("Budget Used", f"{pct_used:.1f}%")
-    
-    st.markdown("---")
-    
-    # Editable budget table
-    st.subheader("Category Budgets")
-    st.markdown("*Edit the 'Assigned' column to set your budgets*")
-    
-    # Prepare display dataframe
-    display_df = df[['Category', 'Assigned', 'Activity', 'Available']].copy()
-    
-    # Format currency columns for display
-    display_df['Assigned_Display'] = display_df['Assigned'].apply(format_currency)
-    display_df['Activity_Display'] = display_df['Activity'].apply(format_currency)
-    display_df['Available_Display'] = display_df['Available'].apply(format_currency)
-    
-    # Use st.data_editor for editable table
-    edited_df = st.data_editor(
-        display_df[['Category', 'Assigned', 'Activity', 'Available']],
-        column_config={
-            "Category": st.column_config.TextColumn("Category", disabled=True),
-            "Assigned": st.column_config.NumberColumn(
-                "Assigned",
-                min_value=0.0,
-                format="$%.2f",
-                help="Amount assigned to this category"
-            ),
-            "Activity": st.column_config.NumberColumn(
-                "Activity (Spent)",
-                disabled=True,
-                format="$%.2f",
-                help="Amount spent in this category"
-            ),
-            "Available": st.column_config.NumberColumn(
-                "Available",
-                disabled=True,
-                format="$%.2f",
-                help="Assigned - Activity"
-            )
-        },
-        hide_index=True,
-        use_container_width=True,
-        key=f"budget_editor_{selected_month.strftime('%Y%m')}"
+    # Fetch existing budgets and category lists
+    all_categories = budget_manager.get_budget_categories()
+    budget_overview = budget_manager.get_budget_overview(selected_month)
+    available_categories = budget_manager.get_available_categories_for_month(
+        selected_month,
+        categories=all_categories
     )
     
-    # Check if any changes were made
-    if not edited_df.equals(display_df[['Category', 'Assigned', 'Activity', 'Available']]):
-        if st.button("💾 Save Budget Changes", type="primary"):
-            # Update budgets in database
-            changes_made = 0
-            for idx, row in edited_df.iterrows():
-                original_assigned = df.loc[df['Category'] == row['Category'], 'Assigned'].values[0]
-                new_assigned = row['Assigned']
-                
-                if original_assigned != new_assigned:
-                    budget_id = df.loc[df['Category'] == row['Category'], 'id'].values[0]
-                    success = budget_manager.update_budget(
-                        budget_id=budget_id,
-                        allocated_amount=new_assigned
-                    )
-                    if success:
-                        changes_made += 1
-            
-            if changes_made > 0:
-                st.success(f"✅ Updated {changes_made} budget(s)!")
-                st.rerun()
+    # Handle add budget flow
+    add_container = st.container()
+    with add_container:
+        add_disabled = not available_categories
+        add_button_clicked = st.button(
+            "+ Add Budget Category",
+            type="primary",
+            disabled=add_disabled,
+            help="Start a new budget envelope" if not add_disabled else "No additional categories available to budget right now."
+        )
+        
+        if add_button_clicked:
+            st.session_state.budget_add_mode = True
+            st.session_state.budget_add_category = None
+            st.session_state.budget_add_amount = 0.0
+        
+        if add_disabled:
+            if not all_categories:
+                st.info("No categories found. Import transactions or add `budget_categories` to `config.yaml` to get started.")
+            elif available_categories is not None and not available_categories and not budget_overview:
+                st.info("No categories available to budget. Add categories to your transactions or configuration.")
             else:
-                st.info("No changes detected.")
+                st.caption("All available categories for this month already have budgets.")
     
-    # Color-coded budget status
+    if st.session_state.budget_add_mode:
+        st.markdown("---")
+        st.subheader("Add Budget Category")
+        with st.container():
+            category_selection = st.selectbox(
+                "Category",
+                options=available_categories,
+                key="budget_add_category",
+                help="Select the category you want to budget."
+            )
+            assigned_amount = st.number_input(
+                "Assigned Amount",
+                min_value=0.0,
+                value=st.session_state.get("budget_add_amount", 0.0),
+                format="%.2f",
+                step=10.0,
+                help="Enter the amount you want to assign to this category."
+            )
+            st.session_state.budget_add_amount = assigned_amount
+            
+            add_actions = st.columns([1, 1, 3])
+            with add_actions[0]:
+                if st.button("Save Budget", type="primary", key="save_new_budget"):
+                    if not category_selection:
+                        st.error("Please select a category.")
+                    elif assigned_amount < 0:
+                        st.error("Assigned amount must be zero or greater.")
+                    else:
+                        result = budget_manager.upsert_monthly_budget(
+                            category=category_selection,
+                            month=selected_month,
+                            allocated_amount=float(assigned_amount)
+                        )
+                        if result:
+                            st.success(f"Budget for **{category_selection}** saved.")
+                            st.session_state.budget_add_mode = False
+                            st.session_state.budget_add_category = None
+                            st.session_state.budget_add_amount = 0.0
+                            st.rerun()
+                        else:
+                            st.error("Failed to save budget. Please try again.")
+            with add_actions[1]:
+                if st.button("Cancel", key="cancel_new_budget"):
+                    st.session_state.budget_add_mode = False
+                    st.session_state.budget_add_category = None
+                    st.session_state.budget_add_amount = 0.0
+                    st.rerun()
+    
     st.markdown("---")
-    st.subheader("Budget Status")
     
-    # Show categories with issues
-    over_budget = df[df['Available'] < 0].sort_values('Available')
-    under_budget = df[(df['Available'] > 0) & (df['Assigned'] > 0)].sort_values('Available', ascending=False)
+    if not budget_overview:
+        st.info("No budget categories added yet. Click '+ Add Budget Category' to start.")
+        return
     
-    if not over_budget.empty:
-        st.error(f"⚠️ {len(over_budget)} categor{'y is' if len(over_budget) == 1 else 'ies are'} over budget!")
-        for _, row in over_budget.iterrows():
-            st.markdown(f"- **{row['Category']}**: {format_currency(row['Available'])} (overspent by {format_currency(abs(row['Available']))})")
+    budget_df = pd.DataFrame(budget_overview)
     
-    if not under_budget.empty:
-        st.success(f"✅ {len(under_budget)} categor{'y has' if len(under_budget) == 1 else 'ies have'} budget remaining")
-        with st.expander("Show categories with remaining budget"):
-            for _, row in under_budget.iterrows():
-                st.markdown(f"- **{row['Category']}**: {format_currency(row['Available'])} remaining")
+    # Summary metrics
+    total_assigned = float(budget_df["assigned"].sum())
+    total_activity = float(budget_df["activity"].sum())
+    total_available = float(budget_df["available"].sum())
+    total_pct_used = (total_activity / total_assigned * 100) if total_assigned > 0 else 0.0
     
-    # Budget tips
-    with st.expander("💡 Budget Tips (YNAB Method)"):
-        st.markdown("""
-        **Rule 1: Give Every Dollar a Job**
-        - Assign all your income to specific categories
-        - Don't leave money unallocated
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Assigned", format_currency(total_assigned))
+    with col2:
+        st.metric("Total Activity", format_currency(total_activity))
+    with col3:
+        availability_color = "normal" if total_available >= 0 else "inverse"
+        st.metric(
+            "Total Available",
+            format_currency(total_available),
+            delta=None,
+            delta_color=availability_color
+        )
+    with col4:
+        st.metric("Budget Used", f"{total_pct_used:.1f}%")
+    
+    st.markdown("---")
+    st.subheader("Category Budgets")
+    
+    def _availability_color(value: float) -> str:
+        if value > 0:
+            return "#2ecc71"  # green
+        if value < 0:
+            return "#e74c3c"  # red
+        return "#f1c40f"      # yellow
+    
+    def _usage_color(percentage: float) -> str:
+        if percentage > 100:
+            return "#e74c3c"  # red
+        if percentage >= 90:
+            return "#f1c40f"  # yellow
+        return "#2ecc71"      # green
+    
+    for budget in budget_overview:
+        st.markdown(
+            f"#### {budget['category']} "
+            f"<span style='font-size:0.9rem; color:#7f8c8d;'>({format_currency(budget['assigned'])} assigned)</span>",
+            unsafe_allow_html=True
+        )
+        row_cols = st.columns([2, 2, 2, 2, 1])
         
-        **Rule 2: Embrace Your True Expenses**
-        - Plan for irregular expenses (insurance, car repairs, etc.)
-        - Break them down into monthly amounts
+        assigned_label = f"Assigned for {budget['category']}"
+        with row_cols[0]:
+            assigned_amount = st.number_input(
+                assigned_label,
+                min_value=0.0,
+                value=float(budget["assigned"]),
+                format="%.2f",
+                step=10.0,
+                label_visibility="collapsed",
+            )
+            st.caption("Assigned")
         
-        **Rule 3: Roll With the Punches**
-        - Move money between categories as needed
-        - Life happens - adjust your budget!
+        with row_cols[1]:
+            st.markdown(f"<div style='font-weight:600;'>{format_currency(budget['activity'])}</div>", unsafe_allow_html=True)
+            st.caption("Activity (Spent)")
         
-        **Rule 4: Age Your Money**
-        - Try to use last month's income for this month's expenses
-        - Build a buffer for financial security
-        """)
+        available_value = float(budget["available"])
+        with row_cols[2]:
+            available_color = _availability_color(available_value)
+            st.markdown(
+                f"<div style='font-weight:600; color:{available_color};'>{format_currency(available_value)}</div>",
+                unsafe_allow_html=True
+            )
+            st.caption("Available")
+        
+        used_pct = float(budget["budget_used_pct"])
+        with row_cols[3]:
+            usage_color = _usage_color(used_pct)
+            st.markdown(
+                f"<div style='font-weight:600; color:{usage_color};'>{used_pct:.1f}%</div>",
+                unsafe_allow_html=True
+            )
+            st.caption("Budget Used")
+        
+        with row_cols[4]:
+            if st.button(
+                "Save",
+                key=f"save_budget_{budget['id']}",
+                help="Persist any changes to the assigned amount for this category."
+            ):
+                if assigned_amount < 0:
+                    st.error("Assigned amount must be zero or greater.")
+                elif abs(assigned_amount - float(budget["assigned"])) < 0.01:
+                    st.info("No changes detected for this category.")
+                else:
+                    updated = budget_manager.update_budget(
+                        budget_id=budget["id"],
+                        allocated_amount=float(assigned_amount)
+                    )
+                    if updated:
+                        st.success(f"Updated budget for **{budget['category']}**.")
+                        # Reset widget state so the new value is shown after rerun
+                        assigned_key = f"Assigned for {budget['category']}"
+                        if assigned_key in st.session_state:
+                            del st.session_state[assigned_key]
+                        st.rerun()
+                    else:
+                        st.error("Failed to update budget. Please try again.")
+        
+        st.markdown(
+            "<hr style='margin-top:0.5rem; margin-bottom:1.5rem; opacity:0.2;'>",
+            unsafe_allow_html=True
+        )
+    
+    with st.expander("View Budget Table"):
+        table_df = budget_df.copy()
+        table_df["Assigned"] = table_df["assigned"].apply(format_currency)
+        table_df["Activity"] = table_df["activity"].apply(format_currency)
+        table_df["Available"] = table_df["available"].apply(format_currency)
+        table_df["Budget Used %"] = table_df["budget_used_pct"].map(lambda v: f"{v:.1f}%")
+        table_df = table_df[["category", "Assigned", "Activity", "Available", "Budget Used %"]]
+        st.dataframe(
+            table_df,
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def render_quick_budget_setup(db_manager: DatabaseManager):

@@ -6,12 +6,13 @@ allocate funds to categories and track spending against budgets.
 """
 
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple, Set
 from datetime import datetime, date, timedelta
 from dataclasses import dataclass
 
 from database_ops import DatabaseManager, Budget, Transaction
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import func
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -54,6 +55,82 @@ class BudgetManager:
         self.db_manager = db_manager
         logger.info("Budget manager initialized")
     
+    @staticmethod
+    def _normalize_category(category: Optional[str]) -> str:
+        """
+        Normalize category names by stripping whitespace.
+        
+        Args:
+            category: Raw category name.
+        
+        Returns:
+            Normalized category string (empty string if None).
+        """
+        if category is None:
+            return ""
+        return category.strip()
+    
+    @staticmethod
+    def _category_key(category: Optional[str]) -> str:
+        """
+        Generate a case-insensitive key for category comparisons.
+        
+        Args:
+            category: Category name.
+        
+        Returns:
+            Lowercase category key.
+        """
+        return BudgetManager._normalize_category(category).lower()
+    
+    @staticmethod
+    def _load_budget_categories_from_config() -> List[str]:
+        """
+        Load fallback budget categories from configuration.
+        
+        Returns:
+            List of category names from config, or empty list.
+        """
+        try:
+            from config_manager import load_config  # Lazy import to avoid circular dependency
+        except ImportError:
+            logger.debug("config_manager not available; skipping budget category fallback.")
+            return []
+        
+        categories_config = load_config().get("budget_categories", [])
+        if not isinstance(categories_config, list):
+            logger.warning("Config value 'budget_categories' is not a list. Ignoring fallback categories.")
+            return []
+        
+        unique: Dict[str, str] = {}
+        for raw in categories_config:
+            normalized = BudgetManager._normalize_category(str(raw))
+            if not normalized:
+                continue
+            key = BudgetManager._category_key(normalized)
+            if key and key not in unique:
+                unique[key] = normalized
+        
+        return sorted(unique.values(), key=str.casefold)
+    
+    @staticmethod
+    def get_month_period(month: date) -> Tuple[date, date]:
+        """
+        Get the first and last day for the provided month.
+        
+        Args:
+            month: Date within the desired month (only month/year are used).
+        
+        Returns:
+            Tuple of (period_start, period_end).
+        """
+        period_start = month.replace(day=1)
+        if period_start.month == 12:
+            period_end = period_start.replace(year=period_start.year + 1, month=1, day=1) - timedelta(days=1)
+        else:
+            period_end = period_start.replace(month=period_start.month + 1, day=1) - timedelta(days=1)
+        return period_start, period_end
+    
     def create_budget(
         self,
         category: str,
@@ -76,11 +153,20 @@ class BudgetManager:
         session = self.db_manager.get_session()
         
         try:
+            normalized_category = self._normalize_category(category)
+            if not normalized_category:
+                logger.error("Cannot create budget without a category name.")
+                return None
+            
+            category_key = self._category_key(normalized_category)
+            period_start_dt = datetime.combine(period_start, datetime.min.time())
+            period_end_dt = datetime.combine(period_end, datetime.max.time())
+            
             # Check for overlapping budgets
             existing = session.query(Budget).filter(
-                Budget.category == category,
-                Budget.period_start <= period_end,
-                Budget.period_end >= period_start
+                func.lower(Budget.category) == category_key,
+                Budget.period_start <= period_end_dt,
+                Budget.period_end >= period_start_dt
             ).first()
             
             if existing:
@@ -89,22 +175,27 @@ class BudgetManager:
                     f"overlapping period {period_start} to {period_end}"
                 )
                 # Update existing instead
+                existing.category = normalized_category
                 existing.allocated_amount = allocated_amount
-                existing.period_start = datetime.combine(period_start, datetime.min.time())
-                existing.period_end = datetime.combine(period_end, datetime.max.time())
+                existing.period_start = period_start_dt
+                existing.period_end = period_end_dt
                 existing.updated_at = datetime.utcnow()
                 session.commit()
+                session.refresh(existing)
+                session.expunge(existing)
                 return existing
             
             budget = Budget(
-                category=category,
+                category=normalized_category,
                 allocated_amount=allocated_amount,
-                period_start=datetime.combine(period_start, datetime.min.time()),
-                period_end=datetime.combine(period_end, datetime.max.time())
+                period_start=period_start_dt,
+                period_end=period_end_dt
             )
             
             session.add(budget)
             session.commit()
+            session.refresh(budget)
+            session.expunge(budget)
             
             logger.info(f"Created budget for '{category}': ${allocated_amount} ({period_start} to {period_end})")
             return budget
@@ -137,13 +228,20 @@ class BudgetManager:
         session = self.db_manager.get_session()
         try:
             period_datetime = datetime.combine(period_date, datetime.min.time())
+            normalized_category = self._normalize_category(category)
+            if not normalized_category:
+                return None
+            category_key = self._category_key(normalized_category)
             
             budget = session.query(Budget).filter(
-                Budget.category == category,
+                func.lower(Budget.category) == category_key,
                 Budget.period_start <= period_datetime,
                 Budget.period_end >= period_datetime
             ).first()
             
+            if budget:
+                session.refresh(budget)
+                session.expunge(budget)
             return budget
         except SQLAlchemyError as e:
             logger.error(f"Failed to get budget: {e}")
@@ -173,6 +271,8 @@ class BudgetManager:
                 Budget.period_end >= period_datetime
             ).order_by(Budget.category).all()
             
+            for budget in budgets:
+                session.expunge(budget)
             return budgets
         except SQLAlchemyError as e:
             logger.error(f"Failed to get budgets: {e}")
@@ -206,12 +306,18 @@ class BudgetManager:
         
         session = self.db_manager.get_session()
         try:
+            normalized_category = self._normalize_category(category)
+            if not normalized_category:
+                return 0.0
+            category_key = self._category_key(normalized_category)
+            
             start_datetime = datetime.combine(period_start, datetime.min.time())
             end_datetime = datetime.combine(period_end, datetime.max.time())
             
             # Sum negative amounts (spending) for this category
             result = session.query(Transaction.amount).filter(
-                Transaction.category == category,
+                Transaction.category.isnot(None),
+                func.lower(Transaction.category) == category_key,
                 Transaction.date >= start_datetime,
                 Transaction.date <= end_datetime,
                 Transaction.is_transfer == 0,  # Exclude transfers
@@ -317,6 +423,8 @@ class BudgetManager:
             
             budget.updated_at = datetime.utcnow()
             session.commit()
+            session.refresh(budget)
+            session.expunge(budget)
             
             logger.info(f"Updated budget {budget_id}")
             return budget
@@ -402,16 +510,26 @@ class BudgetManager:
         session = self.db_manager.get_session()
         
         try:
-            from sqlalchemy import func, distinct
-            
-            # Get all unique categories from transactions
-            categories = session.query(
-                func.coalesce(Transaction.category, 'Uncategorized')
+            raw_categories = session.query(
+                func.trim(Transaction.category)
+            ).filter(
+                Transaction.category.isnot(None),
+                func.trim(Transaction.category) != "",
+                Transaction.is_transfer == 0
             ).distinct().all()
             
-            # Flatten and sort
-            category_list = sorted([cat[0] for cat in categories if cat[0]])
+            unique: Dict[str, str] = {}
+            for (category,) in raw_categories:
+                normalized = self._normalize_category(category)
+                if not normalized:
+                    continue
+                key = self._category_key(normalized)
+                if key == "transfer":
+                    continue
+                if key not in unique:
+                    unique[key] = normalized
             
+            category_list = sorted(unique.values(), key=str.casefold)
             logger.info(f"Found {len(category_list)} unique categories")
             return category_list
             
@@ -453,6 +571,158 @@ class BudgetManager:
             return existing
         
         # Create new budget
+        return self.create_budget(
+            category=category,
+            allocated_amount=allocated_amount,
+            period_start=period_start,
+            period_end=period_end
+        )
+    
+    def get_budget_categories(self) -> List[str]:
+        """
+        Retrieve budget categories from transactions or configuration fallback.
+        
+        Returns:
+            Sorted list of distinct categories.
+        """
+        categories = self.get_all_categories_from_transactions()
+        if categories:
+            return categories
+        fallback = self._load_budget_categories_from_config()
+        if fallback:
+            logger.info("Using fallback budget categories from configuration.")
+        return fallback
+    
+    def get_available_categories_for_month(
+        self,
+        month: date,
+        categories: Optional[List[str]] = None
+    ) -> List[str]:
+        """
+        Get categories that do not yet have a budget for the specified month.
+        
+        Args:
+            month: Month to evaluate.
+            categories: Optional list of categories to evaluate. When omitted,
+                categories will be fetched via get_budget_categories.
+        
+        Returns:
+            Sorted list of available category names.
+        """
+        all_categories = categories if categories is not None else self.get_budget_categories()
+        if not all_categories:
+            return []
+        
+        existing_budgets = self.get_monthly_budgets(month)
+        existing_keys: Set[str] = {self._category_key(budget.category) for budget in existing_budgets}
+        
+        available = [
+            category for category in all_categories
+            if self._category_key(category) not in existing_keys
+        ]
+        return sorted(available, key=str.casefold)
+    
+    def get_monthly_budgets(self, month: date) -> List[Budget]:
+        """
+        Retrieve budgets for the specified month.
+        
+        Args:
+            month: Month to retrieve budgets for.
+        
+        Returns:
+            List of Budget objects.
+        """
+        period_start, period_end = self.get_month_period(month)
+        start_dt = datetime.combine(period_start, datetime.min.time())
+        end_dt = datetime.combine(period_end, datetime.max.time())
+        
+        session = self.db_manager.get_session()
+        try:
+            budgets = session.query(Budget).filter(
+                Budget.period_start == start_dt,
+                Budget.period_end == end_dt
+            ).order_by(func.lower(Budget.category)).all()
+            
+            for budget in budgets:
+                session.expunge(budget)
+            return budgets
+        except SQLAlchemyError as e:
+            logger.error(f"Failed to fetch monthly budgets: {e}")
+            return []
+        finally:
+            session.close()
+    
+    def get_budget_overview(self, month: date) -> List[Dict[str, Any]]:
+        """
+        Build budget overview data for the UI.
+        
+        Args:
+            month: Month to summarize.
+        
+        Returns:
+            List of dictionaries containing budget summary fields.
+        """
+        budgets = self.get_monthly_budgets(month)
+        overview: List[Dict[str, Any]] = []
+        
+        for budget in budgets:
+            period_start = budget.period_start.date()
+            period_end = budget.period_end.date()
+            activity = self.calculate_category_spending(
+                budget.category,
+                period_start=period_start,
+                period_end=period_end
+            )
+            available = budget.allocated_amount - activity
+            used_pct = (activity / budget.allocated_amount * 100) if budget.allocated_amount > 0 else 0.0
+            
+            overview.append({
+                "id": budget.id,
+                "category": budget.category,
+                "assigned": budget.allocated_amount,
+                "activity": activity,
+                "available": available,
+                "period_start": period_start,
+                "period_end": period_end,
+                "budget_used_pct": used_pct
+            })
+        
+        return overview
+    
+    def upsert_monthly_budget(self, category: str, month: date, allocated_amount: float) -> Optional[Budget]:
+        """
+        Create or update a monthly budget for the specified category.
+        
+        Args:
+            category: Category name.
+            month: Target month.
+            allocated_amount: Assigned amount.
+        
+        Returns:
+            Budget instance after update or creation, or None on failure.
+        """
+        period_start, period_end = self.get_month_period(month)
+        existing = self.get_budget(category, period_start)
+        if existing:
+            logger.info(
+                "Updating budget for category '%s' (%s - %s)",
+                category,
+                period_start,
+                period_end
+            )
+            return self.update_budget(
+                budget_id=existing.id,
+                allocated_amount=allocated_amount,
+                period_start=period_start,
+                period_end=period_end
+            )
+        
+        logger.info(
+            "Creating new budget for category '%s' (%s - %s)",
+            category,
+            period_start,
+            period_end
+        )
         return self.create_budget(
             category=category,
             allocated_amount=allocated_amount,
