@@ -10,11 +10,14 @@ For Robinhood CSV format:
 - Purchases in CSV: positive (were already inverted to negative in a previous fix)
 """
 
+import argparse
 import logging
 from pathlib import Path
+from typing import Iterable
+
 import yaml
 
-from database_ops import DatabaseManager, Transaction, Account, AccountType
+from database_ops import DatabaseManager, Transaction, Account
 from utils import ensure_data_dir, resolve_connection_string
 
 logging.basicConfig(
@@ -23,8 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Account to fix
-ACCOUNT_NAME = "Robinhood Gold Card"
+DEFAULT_ACCOUNT_NAME = "Robinhood Gold Card"
 
 
 def _load_config() -> dict:
@@ -35,125 +37,154 @@ def _load_config() -> dict:
     return {}
 
 
-def fix_robinhood_payments(db_manager: DatabaseManager, dry_run: bool = True) -> None:
+def _format_change(trans: Transaction, new_amount: float) -> str:
+    return (
+        f"  {trans.date.date()} | {trans.description[:40]:<40} | "
+        f"${trans.amount:>10.2f} -> ${new_amount:>10.2f}"
+    )
+
+
+def _invert_transactions(transactions: Iterable[Transaction], dry_run: bool) -> int:
+    updated_count = 0
+    for trans in transactions:
+        new_amount = -trans.amount
+        if dry_run:
+            logger.info(_format_change(trans, new_amount))
+        else:
+            trans.amount = new_amount
+            updated_count += 1
+            logger.info(_format_change(trans, new_amount))
+    return updated_count
+
+
+def fix_robinhood_transactions(
+    db_manager: DatabaseManager,
+    account_name: str,
+    *,
+    fix_purchases: bool = True,
+    fix_payments: bool = False,
+    dry_run: bool = True
+) -> None:
     """
-    Invert signs for ONLY payments and refunds in Robinhood account.
+    Reconcile transaction signs for a Robinhood (or similar) credit account.
     
     Args:
-        db_manager: Database manager instance
-        dry_run: If True, show what would be changed without actually changing it
+        db_manager: Active database manager.
+        account_name: Target account name.
+        fix_purchases: When True, invert any positive amounts (purchases) to negative.
+        fix_payments: When True, invert negative Payment/Refund rows to positive.
+        dry_run: If True, only report the changes that would be made.
     """
     session = db_manager.get_session()
-    
     try:
-        # Get the Robinhood account
-        account = session.query(Account).filter(
-            Account.name == ACCOUNT_NAME
-        ).first()
-        
+        account = session.query(Account).filter(Account.name == account_name).first()
         if not account:
-            logger.error(f"Account '{ACCOUNT_NAME}' not found")
+            logger.error("Account '%s' not found", account_name)
             return
         
-        logger.info(f"Found account: {account.name} (ID: {account.id})")
+        logger.info("Fixing transactions for account: %s (ID: %s)", account.name, account.id)
+        total_updates = 0
         
-        # Get ONLY payments and refunds based on description patterns
-        # Payments and refunds in the Robinhood CSV are negative, so they're currently negative in DB
-        # We need to invert them to positive (to reduce debt)
-        # Purchases should remain negative (they increase debt)
-        transactions = session.query(Transaction).filter(
-            Transaction.account_id == account.id,
-            Transaction.amount < 0,  # Only negative amounts
-            (Transaction.description.like('%Payment%') | Transaction.description.like('%Refund%'))
-        ).all()
+        if fix_purchases:
+            purchases = session.query(Transaction).filter(
+                Transaction.account_id == account.id,
+                Transaction.amount > 0
+            ).all()
+            logger.info("Found %s positive transactions (purchases) to invert", len(purchases))
+            total_updates += _invert_transactions(purchases, dry_run)
         
-        logger.info(f"\nFound {len(transactions)} negative transactions (payments/refunds)")
+        if fix_payments:
+            payments = session.query(Transaction).filter(
+                Transaction.account_id == account.id,
+                Transaction.amount < 0,
+                (Transaction.description.like('%Payment%') | Transaction.description.like('%Refund%'))
+            ).all()
+            logger.info("Found %s negative Payment/Refund transactions to invert", len(payments))
+            total_updates += _invert_transactions(payments, dry_run)
         
         if dry_run:
-            logger.info("\n*** DRY RUN MODE - No changes will be made ***\n")
-            
-            # Show what will change
-            logger.info("Transactions that will be inverted:")
-            for trans in transactions:
-                logger.info(
-                    f"  {trans.date.date()} | {trans.description[:40]:<40} | "
-                    f"${trans.amount:>10.2f} -> ${-trans.amount:>10.2f}"
-                )
-        else:
-            logger.info("\n*** UPDATING DATABASE ***\n")
-            
-            # Invert all negative transaction amounts (make them positive)
-            updated_count = 0
-            for trans in transactions:
-                old_amount = trans.amount
-                trans.amount = -old_amount
-                updated_count += 1
-                
-                logger.info(
-                    f"  Updated: {trans.date.date()} | {trans.description[:40]:<40} | "
-                    f"${old_amount:>10.2f} -> ${trans.amount:>10.2f}"
-                )
-            
-            # Commit changes
-            session.commit()
-            logger.info(f"\n✓ Successfully updated {updated_count} transactions")
-            
-            # Update account balance
-            from account_management import AccountManager
-            account_manager = AccountManager(db_manager)
-            
-            logger.info("\nRecalculating account balance...")
-            balance = account_manager.get_balance_with_override(account.id)
-            logger.info(f"  {account.name}: ${balance:,.2f}")
-            
-            logger.info("\nVerifying: This should be NEGATIVE (it's a debt)")
+            logger.info("\n*** DRY RUN COMPLETE - No changes were made ***\n")
+            return
         
-    except Exception as e:
+        if total_updates == 0:
+            logger.info("No transactions required updates.")
+            return
+        
+        session.commit()
+        logger.info("✓ Successfully updated %s transactions", total_updates)
+        
+        from account_management import AccountManager
+        account_manager = AccountManager(db_manager)
+        logger.info("Recalculating account balance...")
+        balance = account_manager.get_balance_with_override(account.id)
+        logger.info("  %s: $%s", account.name, f"{balance:,.2f}")
+    except Exception as exc:  # pragma: no cover - defensive
         session.rollback()
-        logger.error(f"Error fixing payments: {e}", exc_info=True)
+        logger.error("Error adjusting transactions: %s", exc, exc_info=True)
         raise
     finally:
         session.close()
 
 
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Fix Robinhood transaction signs.")
+    parser.add_argument(
+        "--account",
+        default=DEFAULT_ACCOUNT_NAME,
+        help="Account name to correct (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply changes to the database (default: dry run)."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip confirmation prompt when applying changes."
+    )
+    parser.add_argument(
+        "--skip-purchases",
+        action="store_true",
+        help="Do not invert positive purchases."
+    )
+    parser.add_argument(
+        "--include-payments",
+        action="store_true",
+        help="Also invert negative Payment/Refund rows."
+    )
+    return parser
+
+
 if __name__ == "__main__":
-    import sys
+    parser = _build_parser()
+    args = parser.parse_args()
     
-    # Check for flags
-    dry_run = "--apply" not in sys.argv
-    force = "--force" in sys.argv
-    
+    dry_run = not args.apply
     if dry_run:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("DRY RUN MODE - No changes will be made")
-        print("Run with --apply flag to actually update the database")
-        print("="*80 + "\n")
-    else:
-        print("\n" + "="*80)
-        print("APPLY MODE - Database will be updated!")
-        print("Only PAYMENTS and REFUNDS will be inverted (purchases will stay negative)")
-        print("="*80 + "\n")
-        
-        if not force:
-            response = input("Are you sure you want to proceed? (yes/no): ")
-            if response.lower() != "yes":
-                print("Aborted.")
-                sys.exit(0)
+        print("Run with --apply to update the database (use --force to skip the prompt)")
+        print("=" * 80 + "\n")
+    elif not args.force:
+        response = input("Apply changes to the database? (yes/no): ")
+        if response.lower() != "yes":
+            print("Aborted.")
+            raise SystemExit(0)
     
     config = _load_config()
     ensure_data_dir(config)
     connection_string = resolve_connection_string(config)
-    
     db_manager = DatabaseManager(connection_string)
     
     try:
-        fix_robinhood_payments(db_manager, dry_run=dry_run)
+        fix_robinhood_transactions(
+            db_manager,
+            args.account,
+            fix_purchases=not args.skip_purchases,
+            fix_payments=args.include_payments,
+            dry_run=dry_run
+        )
     finally:
         db_manager.close()
-    
-    if dry_run:
-        print("\n" + "="*80)
-        print("DRY RUN COMPLETE - No changes were made")
-        print("Run with --apply flag to actually update the database")
-        print("="*80 + "\n")
 

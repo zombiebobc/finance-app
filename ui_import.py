@@ -53,6 +53,14 @@ def launch_import_tab() -> None:
         "and import transactions in bulk with duplicate detection and transfer handling."
     )
     
+    debug_default = st.session_state.get("import_debug_enabled", False)
+    debug_enabled = st.checkbox(
+        "Show debug details (inferences, raw previews, and status messages)",
+        value=debug_default,
+        help="Useful when a file will not import as expected.",
+    )
+    st.session_state["import_debug_enabled"] = debug_enabled
+    
     if "import_result" in st.session_state:
         result = st.session_state["import_result"]
         status_icon = "✅" if result.get("success") else "⚠️"
@@ -88,11 +96,16 @@ def launch_import_tab() -> None:
         return
     
     config = load_config()
-    connection_string = get_app_connection_string()
     
-    db_manager = DatabaseManager(connection_string)
-    account_manager = AccountManager(db_manager)
-    importer = EnhancedImporter(db_manager, account_manager)
+    try:
+        connection_string = get_app_connection_string()
+        db_manager = DatabaseManager(connection_string)
+        account_manager = AccountManager(db_manager)
+        importer = EnhancedImporter(db_manager, account_manager)
+    except Exception as exc:  # pragma: no cover - defensive
+        st.error(f"Unable to initialize database connection: {exc}")
+        logger.exception("Failed to initialize import dependencies")
+        return
     
     try:
         existing_accounts = account_manager.list_accounts()
@@ -112,11 +125,15 @@ def launch_import_tab() -> None:
             buffer = BytesIO(file_bytes)
             preview = pd.DataFrame()
             error_message: Optional[str] = None
+            spec_debug: Dict[str, object] = {}
             try:
                 preview = preview_csv(buffer)
+                spec_debug["preview_rows"] = len(preview)
+                spec_debug["preview_columns"] = preview.columns.tolist()
             except IngestionError as exc:
                 logger.error("Preview failed for %s: %s", uploaded.name, exc)
                 error_message = str(exc)
+                spec_debug["preview_error"] = error_message
             finally:
                 buffer.seek(0)
             
@@ -128,6 +145,7 @@ def launch_import_tab() -> None:
                 sample_rows=sample_rows
             )
             default_selection = suggestions[0] if suggestions else "Create New Account"
+            spec_debug["suggestions"] = suggestions
             
             specs[file_key] = {
                 "filename": uploaded.name,
@@ -135,6 +153,7 @@ def launch_import_tab() -> None:
                 "preview": preview,
                 "error": error_message,
                 "suggestions": suggestions,
+                "debug": spec_debug,
             }
             _initialize_session_defaults(file_key, {
                 "skip": False,
@@ -182,6 +201,9 @@ def launch_import_tab() -> None:
                 st.caption("Inferred suggestions:")
                 for suggestion in suggestions:
                     st.write(f"- {suggestion}")
+                if debug_enabled:
+                    st.caption("Raw debug info:")
+                    st.json(spec.get("debug", {}))
             
             if selected_account == "Create New Account":
                 with st.expander("Create New Account Details", expanded=True):
@@ -214,7 +236,15 @@ def launch_import_tab() -> None:
                 st.warning("No rows detected in preview. Ensure the CSV contains data before importing.")
             else:
                 st.caption("Preview (first 5 rows)")
-                st.dataframe(preview_df.head(5), use_container_width=True)
+                if debug_enabled:
+                    st.data_editor(
+                        preview_df.head(5),
+                        use_container_width=True,
+                        disabled=True,
+                        key=f"{spec_key}_preview_editor",
+                    )
+                else:
+                    st.dataframe(preview_df.head(5), use_container_width=True)
     
         if st.button("Import Selected Files", type="primary"):
             files_to_import: List[Dict[str, object]] = []
@@ -229,6 +259,7 @@ def launch_import_tab() -> None:
                 entry: Dict[str, object] = {
                     "file_obj": BytesIO(file_bytes),
                     "filename": spec["filename"],
+                    "debug": spec.get("debug", {}),
                 }
                 
                 if selected_account == "Create New Account":
@@ -262,20 +293,29 @@ def launch_import_tab() -> None:
                 def _progress_callback(done: int, total: int) -> None:
                     total = max(total, 1)
                     progress_bar.progress(done / total)
+                    if debug_enabled:
+                        st.info(f"Processed {done}/{total} files...", icon="ℹ️")
                 
-                with st.spinner("Importing transactions..."):
-                    result = importer.batch_import(
-                        files_to_import,
-                        config=config,
-                        apply_categorization=True,
-                        progress_callback=_progress_callback
-                    )
-                
-                st.session_state["import_result"] = result
-                st.session_state.pop("import_specs", None)
-                progress_bar.progress(1.0)
-                st.success("Import completed. Dashboard will refresh automatically.")
-                st.experimental_rerun()
+                try:
+                    with st.spinner("Importing transactions..."):
+                        result = importer.batch_import(
+                            files_to_import,
+                            config=config,
+                            apply_categorization=True,
+                            progress_callback=_progress_callback
+                        )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.exception("Unexpected import failure")
+                    st.error(f"Batch import failed: {exc}")
+                    progress_bar.progress(0.0)
+                else:
+                    st.session_state["import_result"] = result
+                    st.session_state.pop("import_specs", None)
+                    progress_bar.progress(1.0)
+                    if debug_enabled:
+                        st.write("Import result (debug):", result)
+                    st.success("Import completed. Dashboard will refresh automatically.")
+                    st.experimental_rerun()
     finally:
         db_manager.close()
 

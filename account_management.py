@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 _FILENAME_STOP_WORDS = {
     "transactions",
     "transaction",
+    "trans",
     "export",
     "statement",
     "activity",
@@ -29,8 +30,13 @@ _FILENAME_STOP_WORDS = {
     "download",
     "data",
     "account",
+    "acct",
+    "acctt",
     "bank",
     "csv",
+    "balances",
+    "daily",
+    "ofx",
 }
 
 
@@ -45,6 +51,35 @@ def _tokenize_name(value: str) -> List[str]:
 def _title_case(tokens: Iterable[str]) -> str:
     """Convert tokens into a human friendly title case string."""
     return " ".join(token.capitalize() for token in tokens)
+
+
+def _generate_filename_candidates(path: Path) -> List[str]:
+    """
+    Generate candidate account names from a filename.
+    
+    Returns a list ordered from most to least specific. Examples:
+    'chase_checking_2024.csv' -> ['Chase Checking', 'Chase', 'Checking']
+    """
+    candidates: List[str] = []
+    
+    tokens = _tokenize_name(path.stem)
+    if tokens:
+        primary = _title_case(tokens)
+        if primary:
+            candidates.append(primary)
+        if len(tokens) >= 2:
+            candidates.append(_title_case(tokens[:2]))
+        for token in tokens:
+            if len(token) >= 3:
+                candidates.append(token.capitalize())
+    
+    # Fallback to simple stem replacement if nothing remains
+    simple = path.stem.replace("_", " ").replace("-", " ").title().strip()
+    if simple and simple not in candidates:
+        candidates.append(simple)
+    
+    logger.debug("Filename '%s' produced candidates: %s", path.name, candidates)
+    return [candidate for candidate in candidates if candidate]
 
 
 class AccountManager:
@@ -201,12 +236,10 @@ class AccountManager:
         
         suggestions: List[str] = []
         path = Path(file_path)
-        
-        # Primary candidate from filename tokens
         filename_tokens = _tokenize_name(path.stem)
-        base_candidate = _title_case(filename_tokens) if filename_tokens else path.stem.replace("_", " ").replace("-", " ").title().strip()
-        if base_candidate:
-            append_unique(suggestions, base_candidate)
+        filename_candidates = _generate_filename_candidates(path)
+        for candidate in filename_candidates:
+            append_unique(suggestions, candidate)
         
         # Attempt to infer from account-specific columns in preview data
         inferred_account = None
@@ -233,9 +266,10 @@ class AccountManager:
         
         if inferred_account:
             append_unique(suggestions, inferred_account)
+            logger.debug("Inferred account '%s' from preview rows for '%s'", inferred_account, file_path)
         
         # Fuzzy match filename-derived candidate against existing names
-        fuzzy_source = inferred_account or base_candidate
+        fuzzy_source = inferred_account or (filename_candidates[0] if filename_candidates else "")
         if fuzzy_source and existing_names:
             close_matches = difflib.get_close_matches(
                 fuzzy_source,
@@ -257,6 +291,17 @@ class AccountManager:
         suggestions = suggestions[:limit]
         
         append_unique(suggestions, "Create New Account")
+        
+        if not existing_accounts and "Create New Account" in suggestions and len(suggestions) == 1:
+            # Surface a friendly hint when no accounts exist yet.
+            logger.debug("No existing accounts found; forcing create-new for '%s'", file_path)
+        
+        logger.debug(
+            "Account suggestions for '%s': %s (existing names: %s)",
+            file_path,
+            suggestions,
+            existing_names,
+        )
         return suggestions
     
     def update_account(

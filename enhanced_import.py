@@ -25,6 +25,8 @@ from utils import ensure_data_dir
 # Configure logging
 logger = logging.getLogger(__name__)
 
+_ROBINHOOD_ACCOUNT_KEY = "robinhood gold card"
+
 
 class EnhancedImporter:
     """
@@ -65,6 +67,43 @@ class EnhancedImporter:
             self.account_manager.update_account(account_id, balance=balance)
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.warning("Unable to refresh balance for account %s: %s", account_id, exc)
+
+    @staticmethod
+    def _should_invert_signs(account_name: str, account_type: AccountType) -> bool:
+        """
+        Determine whether transaction amounts should be inverted for a given account.
+        
+        Some providers (e.g., Robinhood Gold Card) export purchases as positive numbers.
+        """
+        if account_type != AccountType.CREDIT:
+            return False
+        return account_name.strip().lower() == _ROBINHOOD_ACCOUNT_KEY
+
+    @staticmethod
+    def _invert_transaction_signs(transactions: List[Dict[str, Any]]) -> None:
+        """Invert the sign of each transaction amount in-place."""
+        for trans in transactions:
+            amount = trans.get("amount")
+            if amount is not None:
+                trans["amount"] = -amount
+
+    @staticmethod
+    def _normalize_robinhood_transactions(transactions: List[Dict[str, Any]]) -> None:
+        """
+        Ensure Robinhood transactions follow internal sign conventions:
+            - Purchases (non-payment/refund) should be negative.
+            - Payments and refunds should be positive.
+        """
+        for trans in transactions:
+            amount = trans.get("amount")
+            if amount is None:
+                continue
+            description = (trans.get("description") or "").lower()
+            is_payment_or_refund = "payment" in description or "refund" in description
+            if is_payment_or_refund:
+                trans["amount"] = abs(amount)
+            else:
+                trans["amount"] = -abs(amount)
 
     def _persist_uploaded_file(self, file_obj: BytesIO, filename: str, config: Optional[Dict[str, Any]]) -> Path:
         """Save uploaded bytes to the data directory with a unique filename."""
@@ -311,17 +350,11 @@ class EnhancedImporter:
                 "transactions_imported": 0
             }
         
-        # CRITICAL: Invert sign for credit card transactions with inverted CSV format
-        # Some credit card providers (e.g., Robinhood) use: purchases=positive, payments=negative
-        # App internal format: purchases=negative (increase debt), payments=positive (reduce debt)
-        # Note: Chase cards already use the correct format and don't need inversion
-        invert_sign_accounts = ["Robinhood Gold Card"]  # List of accounts that need sign inversion
-        
-        if account.type == AccountType.CREDIT and account.name in invert_sign_accounts:
-            logger.info(f"Inverting transaction signs for credit card account: {account.name}")
-            for trans in standardized:
-                if trans.get("amount") is not None:
-                    trans["amount"] = -trans["amount"]
+        # CRITICAL: invert sign for known providers exporting purchases as positives
+        if self._should_invert_signs(account.name, account.type):
+            logger.info("Normalizing Robinhood transaction signs for account: %s", account.name)
+            self._invert_transaction_signs(standardized)
+            self._normalize_robinhood_transactions(standardized)
         
         # Apply categorization, transfer detection, and link to account
         from classification import is_transfer, is_credit_card_payment, load_transfer_patterns
@@ -549,7 +582,7 @@ class EnhancedImporter:
             return {
                 "success": True,
                 "files_processed": 0,
-                "totals": {"imported": 0, "duplicates": 0, "skipped": 0},
+                "totals": {"imported": 0, "duplicates": 0, "skipped": 0, "errors": 0},
                 "details": []
             }
         
@@ -605,10 +638,12 @@ class EnhancedImporter:
                 "duplicates": 0,
                 "skipped_transactions": 0,
                 "warnings": [],
+                "debug": {"input_debug": spec.get("debug", {})},
             }
             
             try:
                 persisted_path = self._persist_uploaded_file(file_obj, filename, config)
+                file_result["debug"]["persisted_path"] = str(persisted_path)
                 
                 df = csv_reader.read_csv(persisted_path, chunked=False, on_error="prompt")
                 if df is None or df.empty:
@@ -623,6 +658,7 @@ class EnhancedImporter:
                     totals["skipped"] += 1
                     results.append(file_result)
                     continue
+                file_result["debug"]["standardized_count"] = len(standardized)
                 
                 # Detect potential multi-account files
                 multi_accounts = {
@@ -674,6 +710,11 @@ class EnhancedImporter:
                     trans["account_id"] = account.id
                     trans["account"] = account.name
                 
+                if self._should_invert_signs(account.name, account.type):
+                    logger.info("Normalizing Robinhood transaction signs for account: %s", account.name)
+                    self._invert_transaction_signs(standardized)
+                    self._normalize_robinhood_transactions(standardized)
+                
                 hashes = duplicate_detector.generate_hashes_batch(standardized)
                 standardized_with_hashes = [
                     {**trans, "duplicate_hash": hash_val}
@@ -720,6 +761,14 @@ class EnhancedImporter:
                     else:
                         trans["is_transfer"] = 0
                 
+                if not unique_transactions:
+                    file_result["message"] = "All rows were identified as duplicates."
+                    totals["duplicates"] += len(duplicate_transactions)
+                    totals["skipped"] += skipped_transactions
+                    file_result["duplicates"] = len(duplicate_transactions)
+                    results.append(file_result)
+                    continue
+                
                 transfer_count = 0
                 for trans in unique_transactions:
                     transfer_info = self.detect_transfer(trans, unique_transactions)
@@ -751,6 +800,7 @@ class EnhancedImporter:
                 totals["imported"] += inserted
                 totals["duplicates"] += len(duplicate_transactions)
                 totals["skipped"] += skipped_transactions
+                file_result["debug"]["duplicates_detected"] = len(duplicate_transactions)
                 
                 file_result.update({
                     "success": True,
@@ -768,6 +818,7 @@ class EnhancedImporter:
                 error_message = f"Failed to import {filename}: {exc}"
                 logger.error(error_message, exc_info=True)
                 file_result["message"] = error_message
+                file_result["debug"]["exception"] = repr(exc)
             finally:
                 results.append(file_result)
         

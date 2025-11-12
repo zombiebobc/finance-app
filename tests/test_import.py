@@ -23,7 +23,9 @@ from data_ingestion import CSVReader, preview_csv
 from data_standardization import DataStandardizer
 from duplicate_detection import DuplicateDetector
 from enhanced_import import EnhancedImporter
+from fix_robinhood_payments import fix_robinhood_transactions
 from database_ops import AccountType, DatabaseManager, Transaction, Base
+from utils import IngestionError
 
 
 @pytest.fixture
@@ -145,6 +147,12 @@ class TestCSVReader:
         assert isinstance(preview, pd.DataFrame)
         assert not preview.empty
         assert len(preview) <= 10
+    
+    def test_preview_csv_malformed(self):
+        """Malformed content should raise an IngestionError."""
+        bad_bytes = BytesIO(b"\xff\xfe\x00\x01garbage")
+        with pytest.raises(IngestionError):
+            preview_csv(bad_bytes)
 
 
 class TestDataStandardizer:
@@ -472,6 +480,17 @@ class TestEnhancedImporter:
         
         db_manager.close()
     
+    def test_account_suggestions_empty_db(self, test_database):
+        """When no accounts exist, only Create New Account should appear."""
+        db_manager = DatabaseManager(test_database)
+        db_manager.create_tables()
+        account_manager = AccountManager(db_manager)
+        
+        suggestions = account_manager.get_account_suggestions("mysterious_file.csv")
+        
+        assert suggestions[-1] == "Create New Account"
+        db_manager.close()
+    
     def test_batch_import_creates_new_account_with_override(
         self,
         test_database,
@@ -509,6 +528,7 @@ class TestEnhancedImporter:
                         "type": "bank",
                         "initial_balance": 500.0,
                     },
+                    "debug": {"fake": True},
                 }
             ],
             config=config
@@ -524,6 +544,124 @@ class TestEnhancedImporter:
         overrides = account_manager.get_balance_overrides(account.id)
         assert overrides, "Expected a balance override for the new account"
         assert db_manager.get_transaction_count() == 1
+        assert result["details"][0]["debug"]["input_debug"] == {"fake": True}
         
         db_manager.close()
+
+    def test_batch_import_inverts_robinhood_signs(
+        self,
+        test_database,
+        column_mappings,
+        date_formats
+    ):
+        """Robinhood Gold Card purchases should be stored as negative amounts."""
+        db_manager = DatabaseManager(test_database)
+        db_manager.create_tables()
+        account_manager = AccountManager(db_manager)
+        importer = EnhancedImporter(db_manager, account_manager)
+
+        account = account_manager.create_account("Robinhood Gold Card", AccountType.CREDIT)
+        assert account is not None
+
+        csv_content = (
+            "Date,Description,Amount\n"
+            "2024-01-02,Purchase,150.00\n"
+            "2024-01-03,Payment Thank You,-75.00\n"
+        )
+        file_bytes = BytesIO(csv_content.encode("utf-8"))
+
+        config = {
+            "column_mappings": column_mappings,
+            "processing": {
+                "date_formats": date_formats,
+                "output_date_format": "%Y-%m-%d",
+            },
+            "duplicate_detection": {
+                "key_fields": ["date", "description", "amount"],
+                "hash_algorithm": "md5",
+            },
+        }
+
+        try:
+            result = importer.batch_import(
+                [
+                    {
+                        "file_obj": file_bytes,
+                        "filename": "robinhood.csv",
+                        "account_id": account.id,
+                    }
+                ],
+                config=config
+            )
+
+            assert result["success"] is True
+            details = result["details"][0]
+            assert details["imported"] == 2
+
+            session = db_manager.get_session()
+            try:
+                rows = session.query(Transaction).order_by(Transaction.date.asc()).all()
+                assert len(rows) == 2
+                amounts = {row.description: row.amount for row in rows}
+                assert amounts["Purchase"] == -150.0
+                assert amounts["Payment Thank You"] == 75.0
+            finally:
+                session.close()
+        finally:
+            db_manager.close()
+    
+    def test_fix_robinhood_transactions_updates_existing_rows(self, test_database):
+        """Verify fix script inverts purchases and payments when applied."""
+        db_manager = DatabaseManager(test_database)
+        db_manager.create_tables()
+        account_manager = AccountManager(db_manager)
+        account = account_manager.create_account("Robinhood Gold Card", AccountType.CREDIT)
+        assert account is not None
+
+        session = db_manager.get_session()
+        try:
+            session.add_all([
+                Transaction(
+                    date=datetime(2024, 1, 3),
+                    description="Robinhood Purchase",
+                    amount=120.0,
+                    account=account.name,
+                    account_id=account.id,
+                    source_file="test.csv",
+                    duplicate_hash="hash1",
+                ),
+                Transaction(
+                    date=datetime(2024, 1, 4),
+                    description="Payment Thank You",
+                    amount=-60.0,
+                    account=account.name,
+                    account_id=account.id,
+                    source_file="test.csv",
+                    duplicate_hash="hash2",
+                ),
+            ])
+            session.commit()
+        finally:
+            session.close()
+
+        fix_robinhood_transactions(
+            db_manager,
+            "Robinhood Gold Card",
+            fix_purchases=True,
+            fix_payments=True,
+            dry_run=False
+        )
+
+        session = db_manager.get_session()
+        try:
+            amounts = {
+                row.description: row.amount
+                for row in session.query(Transaction).all()
+            }
+        finally:
+            session.close()
+            db_manager.close()
+
+        assert amounts["Robinhood Purchase"] == -120.0
+        assert amounts["Payment Thank You"] == 60.0
 

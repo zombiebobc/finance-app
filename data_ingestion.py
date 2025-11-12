@@ -330,6 +330,12 @@ def preview_csv(
         IngestionError: If the CSV cannot be parsed safely.
         ValueError: If ``file_obj`` is not seekable.
     """
+    if max_rows <= 0:
+        raise ValueError("preview_csv requires max_rows > 0")
+    
+    if not hasattr(file_obj, "read"):
+        raise ValueError("preview_csv expects a file-like object supporting read/seek.")
+    
     if not hasattr(file_obj, "seek"):
         raise ValueError("preview_csv requires a seekable in-memory file object.")
     
@@ -344,8 +350,13 @@ def preview_csv(
             raise IngestionError(f"Failed to preview CSV with fallback encoding: {exc}") from exc
     except (pd_errors.ParserError, pd_errors.EmptyDataError, ValueError) as exc:
         raise IngestionError(f"Failed to preview CSV: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - defensive catch-all
+        raise IngestionError(f"Unexpected error while previewing CSV: {exc}") from exc
     finally:
         file_obj.seek(0)
+    
+    if df.empty:
+        raise IngestionError("CSV preview returned no rows.")
     
     return df.head(max_rows)
 

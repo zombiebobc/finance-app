@@ -196,6 +196,30 @@ python main.py --config custom_config.yaml import --file transactions.csv
 4. Expand the preview to inspect the normalized data. Mark any files you want to skip before importing.
 5. Click **Import Selected Files** to run a batch import with duplicate detection, transfer tagging, and progress feedback. A detailed summary appears after completion, and the analytics views refresh automatically.
 
+#### Debugging Imports
+
+- Toggle **Show debug details** in the Import tab to display inference data, preview metadata, and progress updates inline.
+- The banner at the top of the tab records the most recent batch results, including any warnings about skipped rows or duplicates.
+- If a CSV fails to preview, review the inline error message and the source file’s headers—malformed files are skipped gracefully.
+- Additional diagnostics are written to `data/import.log`; the script `python -c "from pathlib import Path; print(Path('data/import.log').read_text())"` can be used to inspect recent entries.
+
+#### Correcting Earlier Robinhood Uploads
+
+If you imported Robinhood Gold Card CSVs before the sign-fix landed (purchases showing as positive, payments as negative), you can reconcile the historical data without manually editing rows:
+
+```bash
+# Dry run (shows the adjustments but does not write to the DB)
+python fix_robinhood_payments.py --account "Robinhood Gold Card"
+
+# Apply the fixes (invert positive purchases; prompt before writing)
+python fix_robinhood_payments.py --account "Robinhood Gold Card" --apply
+
+# Optional: also flip negative Payment/Refund entries to positive
+python fix_robinhood_payments.py --account "Robinhood Gold Card" --apply --include-payments --force
+```
+
+By default the script only touches positive purchases (making them negative). Add `--include-payments` if you also want negative payment/refund rows switched to positive. Include `--force` to skip the confirmation prompt when applying changes.
+
 ### Managing Accounts
 
 #### Create an Account
