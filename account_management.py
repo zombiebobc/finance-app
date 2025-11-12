@@ -5,8 +5,11 @@ This module provides CRUD operations for managing financial accounts,
 including banks, credit cards, investments, etc.
 """
 
+import difflib
 import logging
-from typing import List, Optional, Dict, Any
+import re
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Iterable
 from datetime import datetime, date
 
 from database_ops import DatabaseManager, Account, AccountType
@@ -15,6 +18,33 @@ from sqlalchemy import func
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+_FILENAME_STOP_WORDS = {
+    "transactions",
+    "transaction",
+    "export",
+    "statement",
+    "activity",
+    "history",
+    "download",
+    "data",
+    "account",
+    "bank",
+    "csv",
+}
+
+
+def _tokenize_name(value: str) -> List[str]:
+    """Split a candidate name into normalized tokens."""
+    cleaned = re.sub(r"[^\w\s]", " ", value)
+    cleaned = re.sub(r"\d+", " ", cleaned)
+    tokens = [token.strip().lower() for token in cleaned.split() if token.strip()]
+    return [token for token in tokens if token not in _FILENAME_STOP_WORDS]
+
+
+def _title_case(tokens: Iterable[str]) -> str:
+    """Convert tokens into a human friendly title case string."""
+    return " ".join(token.capitalize() for token in tokens)
 
 
 class AccountManager:
@@ -135,6 +165,99 @@ class AccountManager:
             accounts = [acc for acc in accounts if acc.type == account_type]
         
         return accounts
+    
+    def get_account_suggestions(
+        self,
+        file_path: str,
+        *,
+        sample_headers: Optional[List[str]] = None,
+        sample_rows: Optional[List[Dict[str, Any]]] = None,
+        limit: int = 5
+    ) -> List[str]:
+        """
+        Generate ordered account name suggestions for an uploaded CSV file.
+        
+        Heuristics:
+            - Parse filename tokens (e.g., "chase_checking.csv" -> "Chase Checking")
+            - Inspect CSV headers/rows for consistent account columns
+            - Fuzzy match against existing account names using difflib
+        
+        Args:
+            file_path: Original filename or path of the uploaded CSV.
+            sample_headers: Optional list of CSV headers for additional context.
+            sample_rows: Optional list of row dictionaries (typically preview rows).
+            limit: Maximum number of suggestions (excluding the "Create New Account" sentinel).
+        
+        Returns:
+            Ordered list of suggested account display names. Always includes
+            "Create New Account" as a fallback option.
+        """
+        existing_accounts = self.db_manager.get_all_accounts()
+        existing_names = [acc.name for acc in existing_accounts]
+        
+        def append_unique(container: List[str], value: str) -> None:
+            if value and value not in container:
+                container.append(value)
+        
+        suggestions: List[str] = []
+        path = Path(file_path)
+        
+        # Primary candidate from filename tokens
+        filename_tokens = _tokenize_name(path.stem)
+        base_candidate = _title_case(filename_tokens) if filename_tokens else path.stem.replace("_", " ").replace("-", " ").title().strip()
+        if base_candidate:
+            append_unique(suggestions, base_candidate)
+        
+        # Attempt to infer from account-specific columns in preview data
+        inferred_account = None
+        account_like_headers: List[str] = []
+        if sample_headers:
+            for header in sample_headers:
+                header_lower = header.lower()
+                if "account" in header_lower or "card" in header_lower or "wallet" in header_lower:
+                    account_like_headers.append(header)
+                    if header_lower in {"account", "account name"}:
+                        break
+        
+        if account_like_headers and sample_rows:
+            for candidate_header in account_like_headers:
+                column_values = {
+                    str(row.get(candidate_header, "")).strip()
+                    for row in sample_rows
+                    if row.get(candidate_header)
+                }
+                column_values = {value for value in column_values if value}
+                if len(column_values) == 1:
+                    inferred_account = column_values.pop()
+                    break
+        
+        if inferred_account:
+            append_unique(suggestions, inferred_account)
+        
+        # Fuzzy match filename-derived candidate against existing names
+        fuzzy_source = inferred_account or base_candidate
+        if fuzzy_source and existing_names:
+            close_matches = difflib.get_close_matches(
+                fuzzy_source,
+                existing_names,
+                n=limit,
+                cutoff=0.8
+            )
+            for match in close_matches:
+                append_unique(suggestions, match)
+        
+        # Keyword-based partial matches for tougher cases
+        if filename_tokens and existing_names:
+            for existing in existing_names:
+                lower_name = existing.lower()
+                if any(token in lower_name for token in filename_tokens):
+                    append_unique(suggestions, existing)
+        
+        # Ensure existing suggestions do not exceed limit (excluding sentinel)
+        suggestions = suggestions[:limit]
+        
+        append_unique(suggestions, "Create New Account")
+        return suggestions
     
     def update_account(
         self,

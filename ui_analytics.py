@@ -6,7 +6,6 @@ exploring financial data with charts, filters, and drill-down.
 """
 
 import logging
-from pathlib import Path
 from typing import Optional, Dict
 from datetime import date
 import pandas as pd
@@ -35,25 +34,12 @@ from config_manager import (
     get_net_worth_goal,
     set_net_worth_goal,
     get_dashboard_preference,
-    initialize_session_state
+    initialize_session_state,
+    get_app_connection_string
 )
-from utils import ensure_data_dir, resolve_connection_string
+from ui_import import launch_import_tab
 
 logger = logging.getLogger(__name__)
-
-
-def load_connection_string() -> str:
-    """Resolve the database connection string with data directory initialization."""
-    import yaml
-    
-    config_path = Path('config.yaml')
-    config = {}
-    if config_path.exists():
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f) or {}
-    
-    ensure_data_dir(config)
-    return resolve_connection_string(config)
 
 
 def display_comparison_summary(
@@ -447,7 +433,7 @@ def main_ui_analytics():
     initialize_session_state()
     
     # Load database
-    connection_string = load_connection_string()
+    connection_string = get_app_connection_string()
     
     try:
         db_manager = DatabaseManager(connection_string)
@@ -516,7 +502,7 @@ def main_ui_analytics():
     # Report type selection
     report_type = st.sidebar.radio(
         "Report Type",
-        ["Overview", "Budget", "Spending Categories", "Income Categories", "Trends", "Accounts", "Comparison"]
+        ["Overview", "Budget", "Spending Categories", "Income Categories", "Trends", "Accounts", "Comparison", "Import Data"]
     )
     
     # Net Worth Goal Setting
@@ -561,6 +547,9 @@ def main_ui_analytics():
         
         elif report_type == "Comparison":
             render_comparison(analytics, report_gen)
+        
+        elif report_type == "Import Data":
+            launch_import_tab()
     
     except Exception as e:
         st.error(f"Error generating report: {e}")

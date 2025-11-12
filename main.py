@@ -105,13 +105,22 @@ def import_transactions(
         Dictionary with import statistics
     """
     # Initialize components
-    csv_reader = CSVReader(chunk_size=config.get("processing", {}).get("chunk_size", 10000))
+    processing_cfg = config.get("processing", {})
+
+    csv_reader = CSVReader(
+        chunk_size=processing_cfg.get("chunk_size", 10000),
+        auto_chunk_mb=processing_cfg.get("auto_chunk_mb", 25),
+        skip_on_error=processing_cfg.get("skip_on_error", True),
+    )
     
     standardizer = DataStandardizer(
         column_mappings=config.get("column_mappings", {}),
-        date_formats=config.get("processing", {}).get("date_formats", []),
-        output_date_format=config.get("processing", {}).get("output_date_format", "%Y-%m-%d"),
-        amount_decimal_places=config.get("processing", {}).get("amount_decimal_places", 2)
+        date_formats=processing_cfg.get("date_formats", []),
+        output_date_format=processing_cfg.get("output_date_format", "%Y-%m-%d"),
+        amount_decimal_places=processing_cfg.get("amount_decimal_places", 2),
+        max_error_rows=processing_cfg.get("max_error_rows"),
+        max_error_ratio=processing_cfg.get("error_ratio", 0.1),
+        fallback_values=processing_cfg.get("fallback_values"),
     )
     
     duplicate_detector = DuplicateDetector(
@@ -159,7 +168,7 @@ def import_transactions(
             
             if use_chunking:
                 logger.info(f"Processing large file in chunks: {file_path}")
-                chunk_iterator = csv_reader.read_csv(file_path, chunked=True)
+                chunk_iterator = csv_reader.read_csv(file_path, chunked=True, on_error="prompt")
                 
                 for chunk_df in chunk_iterator:
                     file_stats["rows_read"] += len(chunk_df)
@@ -206,7 +215,7 @@ def import_transactions(
                         file_stats["skipped"] += skipped
             else:
                 # Process entire file at once
-                df = csv_reader.read_csv(file_path, chunked=False)
+                df = csv_reader.read_csv(file_path, chunked=False, on_error="prompt")
                 file_stats["rows_read"] = len(df)
                 
                 # Standardize

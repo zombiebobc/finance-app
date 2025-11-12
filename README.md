@@ -17,6 +17,13 @@ A modular Python application for importing financial transaction data from CSV f
 - **Robust Error Handling**: Handles malformed data, missing fields, and invalid values gracefully
 - **Chunked Processing**: Efficiently processes large CSV files in chunks
 - **Comprehensive Logging**: Tracks import progress, errors, and statistics
+- **Streamlit Import Tab**: Bulk upload multiple CSVs from the dashboard with previews, account inference, duplicate detection, and progress feedback
+
+### Robust Error Handling
+- **Custom Exceptions**: Import pipelines raise `IngestionError` and `StandardizationError` with precise context, making it easier to identify and remediate failures.
+- **Interactive Recovery**: When running from the CLI, the importer prompts to skip rows, retry with safe defaults, or abort, preventing hard crashes on malformed data.
+- **Configurable Thresholds**: Tune `processing.error_ratio`, `processing.max_error_rows`, and `processing.fallback_values` in `config.yaml` to control how many bad rows are tolerated and what defaults should be applied.
+- **Automatic Fallbacks**: CSV ingestion retries alternate encodings and parsing engines before prompting or skipping, while standardization can default missing amounts/descriptions using the configured fallbacks.
 
 ### Account Management Features
 - **Multiple Account Types**: Support for banks, credit cards, investments, cash, and other account types
@@ -180,6 +187,14 @@ Use a custom configuration file:
 ```bash
 python main.py --config custom_config.yaml import --file transactions.csv
 ```
+
+### Streamlit Import Data Tab
+
+1. Launch the Streamlit analytics app (`streamlit run ui_analytics.py`) and open the **Import Data** tab in the sidebar.
+2. Upload one or more CSV files. The app previews the first few rows, infers the likely account, and highlights possible issues.
+3. For each file, choose an existing account or select **Create New Account** to enter the account name, type, and optional starting balance.
+4. Expand the preview to inspect the normalized data. Mark any files you want to skip before importing.
+5. Click **Import Selected Files** to run a batch import with duplicate detection, transfer tagging, and progress feedback. A detailed summary appears after completion, and the analytics views refresh automatically.
 
 ### Managing Accounts
 

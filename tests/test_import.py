@@ -11,16 +11,19 @@ Tests cover:
 import pytest
 import tempfile
 import os
+from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from data_ingestion import CSVReader
+from account_management import AccountManager
+from data_ingestion import CSVReader, preview_csv
 from data_standardization import DataStandardizer
 from duplicate_detection import DuplicateDetector
-from database_ops import DatabaseManager, Transaction, Base
+from enhanced_import import EnhancedImporter
+from database_ops import AccountType, DatabaseManager, Transaction, Base
 
 
 @pytest.fixture
@@ -69,6 +72,7 @@ def test_database():
     yield connection_string
     
     # Cleanup
+    engine.dispose()
     if os.path.exists(temp_db):
         os.unlink(temp_db)
 
@@ -132,6 +136,15 @@ class TestCSVReader:
         assert info["rows"] == 3
         assert "Date" in info["columns"]
         assert info["valid"] is True
+    
+    def test_preview_csv(self, sample_csv_file):
+        """Ensure preview_csv returns a limited DataFrame from bytes."""
+        with open(sample_csv_file, "rb") as handle:
+            preview = preview_csv(BytesIO(handle.read()))
+        
+        assert isinstance(preview, pd.DataFrame)
+        assert not preview.empty
+        assert len(preview) <= 10
 
 
 class TestDataStandardizer:
@@ -438,6 +451,79 @@ class TestIntegration:
         # Verify database
         count = db_manager.get_transaction_count()
         assert count == 3
+        
+        db_manager.close()
+
+
+class TestEnhancedImporter:
+    """Tests for enhanced importer helpers."""
+    
+    def test_account_suggestions(self, test_database):
+        """Account suggestions should include existing names and create-new sentinel."""
+        db_manager = DatabaseManager(test_database)
+        db_manager.create_tables()
+        account_manager = AccountManager(db_manager)
+        account_manager.create_account("Chase Checking", AccountType.BANK)
+        
+        suggestions = account_manager.get_account_suggestions("chase_checking.csv")
+        
+        assert "Chase Checking" in suggestions
+        assert suggestions[-1] == "Create New Account"
+        
+        db_manager.close()
+    
+    def test_batch_import_creates_new_account_with_override(
+        self,
+        test_database,
+        column_mappings,
+        date_formats
+    ):
+        """Batch import should create a new account and respect initial balance overrides."""
+        db_manager = DatabaseManager(test_database)
+        db_manager.create_tables()
+        account_manager = AccountManager(db_manager)
+        importer = EnhancedImporter(db_manager, account_manager)
+        
+        csv_content = "Date,Description,Amount\n2024-01-01,Initial Deposit,1000.00\n"
+        file_bytes = BytesIO(csv_content.encode("utf-8"))
+        
+        config = {
+            "column_mappings": column_mappings,
+            "processing": {
+                "date_formats": date_formats,
+                "output_date_format": "%Y-%m-%d",
+            },
+            "duplicate_detection": {
+                "key_fields": ["date", "description", "amount"],
+                "hash_algorithm": "md5",
+            },
+        }
+        
+        result = importer.batch_import(
+            [
+                {
+                    "file_obj": file_bytes,
+                    "filename": "test_account.csv",
+                    "new_account": {
+                        "name": "Test Account",
+                        "type": "bank",
+                        "initial_balance": 500.0,
+                    },
+                }
+            ],
+            config=config
+        )
+        
+        assert result["success"] is True
+        details = result["details"][0]
+        assert details["imported"] == 1
+        
+        account = account_manager.get_account_by_name("Test Account")
+        assert account is not None
+        
+        overrides = account_manager.get_balance_overrides(account.id)
+        assert overrides, "Expected a balance override for the new account"
+        assert db_manager.get_transaction_count() == 1
         
         db_manager.close()
 

@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from sqlalchemy.engine import make_url
 
@@ -19,6 +20,59 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _DEFAULT_DATA_DIR_NAME = "data"
 _DEFAULT_DB_FILENAME = "transactions.db"
+
+
+# Added: Custom exceptions for ingestion and standardization workflows
+class IngestionError(ValueError):
+    """Raised when CSV ingestion encounters a non-recoverable error."""
+
+
+# Added: Custom exceptions for ingestion and standardization workflows
+class StandardizationError(ValueError):
+    """Raised when data standardization cannot continue safely."""
+
+
+# Added: Prompt utility to support interactive CLI fallbacks
+def prompt_user_choice(
+    message: str,
+    options: Dict[str, str],
+    default: str,
+    *,
+    input_func: Optional[Callable[[str], str]] = None
+) -> str:
+    """
+    Display an interactive prompt and return the selected option key.
+
+    Args:
+        message: Prompt message shown to the user.
+        options: Mapping of option keys to human-readable descriptions.
+        default: Option key to return when no interactive input is available.
+        input_func: Optional callable to replace `input` (useful for testing).
+
+    Returns:
+        Selected option key from the provided mapping.
+    """
+    if not options:
+        raise ValueError("prompt_user_choice requires at least one option.")
+
+    if default not in options:
+        raise ValueError(f"Default option '{default}' not present in options: {list(options)}")
+
+    # Prefer non-blocking behavior when stdin is not interactive
+    if input_func is None:
+        if not sys.stdin or not sys.stdin.isatty():
+            logger.debug("Non-interactive environment detected; using default option '%s'.", default)
+            return default
+        input_func = input  # type: ignore[assignment]
+
+    prompt_suffix = " / ".join(f"{key}={desc}" for key, desc in options.items())
+    while True:
+        user_input = input_func(f"{message} ({prompt_suffix}) [{default}]: ").strip().lower()
+        if not user_input:
+            return default
+        if user_input in options:
+            return user_input
+        logger.warning("Invalid choice '%s'. Valid options: %s", user_input, list(options))
 
 
 def get_project_root() -> Path:

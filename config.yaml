@@ -86,6 +86,9 @@ net_worth_history_days: 90
 processing:
   amount_decimal_places: 2
   chunk_size: 10000
+  auto_chunk_mb: 25
+  max_error_rows: 500
+  error_ratio: 0.1
   date_formats:
   - '%Y-%m-%d'
   - '%m/%d/%Y'
@@ -97,6 +100,10 @@ processing:
   - '%m.%d.%Y'
   - '%d.%m.%Y'
   output_date_format: '%Y-%m-%d'
+  fallback_values:
+    amount: 0.0
+    description: 'Unknown transaction'
+    category: 'Uncategorized'
 show_sparklines: true
 standard_fields:
 - date

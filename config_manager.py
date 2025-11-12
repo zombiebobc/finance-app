@@ -11,6 +11,8 @@ from typing import Any, Dict, Optional
 import yaml
 import streamlit as st
 
+from utils import ensure_data_dir, resolve_connection_string
+
 logger = logging.getLogger(__name__)
 
 # Default configuration values
@@ -51,6 +53,18 @@ def load_config() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error loading configuration: {e}", exc_info=True)
         return DEFAULT_CONFIG.copy()
+
+
+def get_app_connection_string() -> str:
+    """
+    Resolve the application's database connection string with ensured data directory.
+    
+    Returns:
+        SQLAlchemy connection string for the app database.
+    """
+    config = load_config()
+    ensure_data_dir(config)
+    return resolve_connection_string(config)
 
 
 def save_config(config: Dict[str, Any]) -> bool:
