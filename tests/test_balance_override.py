@@ -11,6 +11,8 @@ from unittest.mock import Mock, MagicMock
 
 from account_management import AccountManager
 from database_ops import DatabaseManager, AccountType
+from uuid import uuid4
+from datetime import datetime
 
 
 @pytest.fixture
@@ -23,6 +25,19 @@ def mock_db_manager():
 def account_manager(mock_db_manager):
     """Create an account manager with mock database."""
     return AccountManager(mock_db_manager)
+
+
+@pytest.fixture
+def account_manager_db(tmp_path):
+    """Create an account manager backed by a real temporary database."""
+    db_path = tmp_path / "balance_override.db"
+    manager = DatabaseManager(f"sqlite:///{db_path}")
+    manager.create_tables()
+    account_mgr = AccountManager(manager)
+    yield account_mgr
+    manager.close()
+    if db_path.exists():
+        db_path.unlink()
 
 
 class TestBalanceOverride:
@@ -94,134 +109,77 @@ class TestBalanceOverride:
 class TestBalanceCalculationWithOverride:
     """Test balance calculations with overrides."""
     
-    def test_balance_with_override_no_transactions(self, account_manager):
+    def test_balance_with_override_no_transactions(self, account_manager_db):
         """Test balance calculation with override but no transactions after."""
-        mock_session = Mock()
-        account_manager.db_manager.get_session.return_value = mock_session
+        account = account_manager_db.create_account("Test Account", AccountType.BANK)
+        override_date = date(2024, 1, 1)
+        account_manager_db.set_balance_override(account.id, override_date, 5000.00)
         
-        # Mock override
-        mock_override = Mock()
-        mock_override.override_date = date(2024, 1, 1)
-        mock_override.override_balance = 5000.00
-        
-        mock_query = Mock()
-        mock_query.filter.return_value.order_by.return_value.first.return_value = mock_override
-        mock_session.query.return_value = mock_query
-        
-        # Mock no transactions
-        mock_query.filter.return_value.scalar.return_value = 0.0
-        
-        # Calculate balance
-        balance = account_manager.get_balance_with_override(
-            account_id=1,
-            as_of_date=date.today()
-        )
-        
-        # Balance should equal override
+        balance = account_manager_db.get_balance_with_override(account.id, date.today())
         assert balance == 5000.00
     
-    def test_balance_with_override_and_transactions(self, account_manager):
+    def test_balance_with_override_and_transactions(self, account_manager_db):
         """Test balance calculation with override and subsequent transactions."""
-        mock_session = Mock()
-        account_manager.db_manager.get_session.return_value = mock_session
+        account = account_manager_db.create_account("Test Account", AccountType.BANK)
+        override_date = date(2024, 1, 1)
+        account_manager_db.set_balance_override(account.id, override_date, 5000.00)
         
-        # Mock override
-        mock_override = Mock()
-        mock_override.override_date = date(2024, 1, 1)
-        mock_override.override_balance = 5000.00
+        db_manager = account_manager_db.db_manager
+        db_manager.insert_transactions([{
+            "date": datetime(2024, 2, 1),
+            "description": "Deposit",
+            "amount": 1500.00,
+            "category": "Income",
+            "account_id": account.id,
+            "account": account.name,
+            "source_file": "test.csv",
+            "duplicate_hash": f"hash-{uuid4()}",
+            "is_transfer": 0
+        }])
         
-        # Create separate mocks for each query
-        mock_override_query = Mock()
-        mock_override_query.filter.return_value.order_by.return_value.first.return_value = mock_override
-        
-        mock_transaction_query = Mock()
-        mock_transaction_query.filter.return_value.scalar.return_value = 1500.00
-        
-        # Configure session.query to return different mocks based on what's being queried
-        def mock_query_func(model):
-            # Import here to avoid circular imports in tests
-            from database_ops import BalanceOverride
-            if model == BalanceOverride:
-                return mock_override_query
-            else:  # Transaction
-                return mock_transaction_query
-        
-        mock_session.query.side_effect = mock_query_func
-        
-        # Calculate balance
-        balance = account_manager.get_balance_with_override(
-            account_id=1,
-            as_of_date=date.today()
-        )
-        
-        # Balance should be override + transactions
+        balance = account_manager_db.get_balance_with_override(account.id, date.today())
         assert balance == 6500.00  # 5000 + 1500
     
-    def test_balance_without_override(self, account_manager):
+    def test_balance_without_override(self, account_manager_db):
         """Test balance calculation without any override (full sum)."""
-        mock_session = Mock()
-        account_manager.db_manager.get_session.return_value = mock_session
+        account = account_manager_db.create_account("Test Account", AccountType.BANK)
+        db_manager = account_manager_db.db_manager
+        db_manager.insert_transactions([{
+            "date": datetime(2024, 3, 1),
+            "description": "Salary",
+            "amount": 3000.00,
+            "category": "Income",
+            "account_id": account.id,
+            "account": account.name,
+            "source_file": "test.csv",
+            "duplicate_hash": f"hash-{uuid4()}",
+            "is_transfer": 0
+        }])
         
-        # No override found
-        mock_override_query = Mock()
-        mock_override_query.filter.return_value.order_by.return_value.first.return_value = None
-        
-        # Mock all transactions sum to 3000
-        mock_transaction_query = Mock()
-        mock_transaction_query.filter.return_value.scalar.return_value = 3000.00
-        
-        def mock_query_func(model):
-            from database_ops import BalanceOverride
-            if model == BalanceOverride:
-                return mock_override_query
-            else:
-                return mock_transaction_query
-        
-        mock_session.query.side_effect = mock_query_func
-        
-        # Calculate balance
-        balance = account_manager.get_balance_with_override(
-            account_id=1,
-            as_of_date=date.today()
-        )
-        
-        # Balance should be sum of all transactions
+        balance = account_manager_db.get_balance_with_override(account.id, date.today())
         assert balance == 3000.00
     
-    def test_balance_as_of_past_date(self, account_manager):
+    def test_balance_as_of_past_date(self, account_manager_db):
         """Test balance calculation as of a past date."""
-        mock_session = Mock()
-        account_manager.db_manager.get_session.return_value = mock_session
+        account = account_manager_db.create_account("Test Account", AccountType.BANK)
+        override_date = date(2024, 1, 1)
+        account_manager_db.set_balance_override(account.id, override_date, 5000.00)
         
-        # Mock override
-        mock_override = Mock()
-        mock_override.override_date = date(2024, 1, 1)
-        mock_override.override_balance = 5000.00
+        db_manager = account_manager_db.db_manager
+        db_manager.insert_transactions([{
+            "date": datetime(2024, 4, 1),
+            "description": "Bonus",
+            "amount": 500.00,
+            "category": "Income",
+            "account_id": account.id,
+            "account": account.name,
+            "source_file": "test.csv",
+            "duplicate_hash": f"hash-{uuid4()}",
+            "is_transfer": 0
+        }])
         
-        mock_override_query = Mock()
-        mock_override_query.filter.return_value.order_by.return_value.first.return_value = mock_override
-        
-        # Transactions up to past date
-        mock_transaction_query = Mock()
-        mock_transaction_query.filter.return_value.scalar.return_value = 500.00
-        
-        def mock_query_func(model):
-            from database_ops import BalanceOverride
-            if model == BalanceOverride:
-                return mock_override_query
-            else:
-                return mock_transaction_query
-        
-        mock_session.query.side_effect = mock_query_func
-        
-        # Calculate balance as of past date
         past_date = date(2024, 6, 1)
-        balance = account_manager.get_balance_with_override(
-            account_id=1,
-            as_of_date=past_date
-        )
-        
-        # Should use override and transactions up to that date
+        balance = account_manager_db.get_balance_with_override(account.id, past_date)
         assert balance == 5500.00
 
 

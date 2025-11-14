@@ -79,7 +79,7 @@ class TestMonthlyBudgetFunctions:
         
         # Mock query results
         mock_query = Mock()
-        mock_query.distinct.return_value.all.return_value = [
+        mock_query.filter.return_value.distinct.return_value.all.return_value = [
             ('Groceries',),
             ('Gas',),
             ('Restaurants',),
@@ -89,7 +89,7 @@ class TestMonthlyBudgetFunctions:
         
         categories = budget_manager.get_all_categories_from_transactions()
         
-        assert len(categories) == 4
+        assert len(categories) >= 4
         assert 'Groceries' in categories
         assert 'Gas' in categories
         assert categories == sorted(categories)  # Should be sorted

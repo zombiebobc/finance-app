@@ -14,6 +14,12 @@ import pandas as pd
 from data_viewer import DataViewer
 from database_ops import DatabaseManager
 from utils import ensure_data_dir, resolve_connection_string
+from exceptions import (
+    FinanceAppError,
+    ConfigError,
+    DatabaseError,
+    UIError
+)
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -77,8 +83,24 @@ def main_ui_viewer(connection_string: Optional[str] = None) -> None:
     
     try:
         viewer, db_manager = get_viewer()
+    except DatabaseError as e:
+        # User-friendly error message for UI
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        st.error(f"Database connection failed: {error_msg}")
+        if e.details:
+            with st.expander("Error Details"):
+                for key, value in e.details.items():
+                    st.text(f"{key}: {value}")
+        logger.error(f"Database error: {error_msg}", exc_info=True)
+        st.stop()
+    except (ConfigError, FinanceAppError) as e:
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        st.error(f"Configuration error: {error_msg}")
+        logger.error(f"Config error: {error_msg}", exc_info=True)
+        st.stop()
     except Exception as e:
-        st.error(f"Error connecting to database: {e}")
+        st.error("An unexpected error occurred while connecting to the database.")
+        logger.exception(f"Unexpected error connecting to database: {e}")
         st.stop()
     
     # Title and header
@@ -276,12 +298,23 @@ def main_ui_viewer(connection_string: Optional[str] = None) -> None:
             with st.expander("🔍 View Raw Data", expanded=False):
                 st.dataframe(df, use_container_width=True, height=400)
     
+    except (DatabaseError, FinanceAppError) as e:
+        # Normalize error messages for UI
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        st.error(f"Error: {error_msg}")
+        logger.error(f"UI viewer error: {error_msg}", exc_info=True)
+        if e.details:
+            with st.expander("Error Details"):
+                for key, value in e.details.items():
+                    st.text(f"{key}: {value}")
     except ValueError as e:
         st.error(f"Invalid filter: {e}")
+        logger.warning(f"Invalid filter value: {e}")
     except Exception as e:
-        logger.error(f"Error in UI viewer: {e}", exc_info=True)
-        st.error(f"Error: {e}")
-        st.exception(e)
+        # Unexpected error - show user-friendly message, log full details
+        st.error("An unexpected error occurred while viewing transactions.")
+        logger.exception(f"Unexpected UI viewer error: {e}")
+        st.info("💡 Please check the logs for more details or try refreshing the page.")
     
     # Footer
     st.markdown("---")

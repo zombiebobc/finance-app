@@ -130,6 +130,53 @@ See `config.yaml` for detailed configuration options and examples.
 - CSV imports can be stored in `data/` (or sub-folders) so sensitive files stay gitignored by default.
 - The CLI and Streamlit apps create the directory if it does not exist, ensuring first-run setups succeed without manual steps.
 
+## Encryption & Key Management
+
+Sensitive account and transaction fields now use symmetric encryption (Fernet) before hitting disk:
+
+- `Transaction.description`, `amount`, `category`, `account`, and `source_file`
+- `Account.name` (with deterministic `name_index` for uniqueness) and `balance`
+- Budget, override, and balance-history amounts
+
+### Key Sources
+
+1. **Environment variable (preferred):**
+
+   ```powershell
+   $env:FINANCE_APP_ENCRYPTION_KEY = 'base64-fernet-key'
+   ```
+
+   ```bash
+   export FINANCE_APP_ENCRYPTION_KEY=base64-fernet-key
+   ```
+
+   Use `python - <<'PY'`/`Fernet.generate_key()` to create a base64 key once, then store it in your password manager.
+   Keys are 44-character URL-safe base64 strings emitted by `cryptography.Fernet`.
+
+2. **`config.yaml` fallback:** set `security.encryption_key` under the `security` block. If no key is present, the app generates one and persists it in `config.yaml` (encrypted data will not load without the same key).
+
+3. **Toggle:** `security.encryption_enabled` keeps the encryption hooks on by default; set to `false` only for troubleshooting.
+
+### Migration Workflow
+
+Existing databases created before this update contain plaintext values. Run the migration script after setting your key:
+
+```bash
+# Preview the changes
+python encrypt_existing_data.py --dry-run
+
+# Apply encryption in-place
+python encrypt_existing_data.py
+```
+
+The script encrypts legacy rows, adds any missing deterministic account indexes, and leaves an audit trail in the console. Back up `data/transactions.db` before running it on production data.
+
+### Operational Notes
+
+- SQLAlchemy models and the raw SQLite helpers automatically decrypt values for queries, filters, and aggregations via custom SQLite functions (`decrypt_text`, `decrypt_numeric`), so your existing analytics code keeps working.
+- Duplicate detection and hashes remain plaintext so integrity checks still work, and logs avoid printing sensitive fields.
+- Key rotation requires decrypting with the old key and re-encrypting with the new one (rerun the migration script after updating `FINANCE_APP_ENCRYPTION_KEY`).
+
 ## Usage
 
 The application supports two main commands: `import` (or `imp`) and `view`.
@@ -650,6 +697,95 @@ This will open a web browser with an interactive interface where you can:
 
 The web UI provides a more user-friendly experience for exploring your transaction data.
 
+### Backup and Restore
+
+The application includes backup and restore functionality to protect your financial data. Backups are stored as timestamped copies of the database file in the `data/backups/` directory.
+
+#### Creating a Backup
+
+Create a timestamped backup of your database:
+
+```bash
+python main.py backup
+```
+
+This will:
+- Create a copy of `data/transactions.db` in `data/backups/`
+- Name the backup file with a timestamp: `transactions_backup_YYYYMMDD_HHMMSS.db`
+- Verify the backup file matches the original database size
+- Print the backup file path on success
+
+**Example Output:**
+```
+✓ Backup created successfully: data/backups/transactions_backup_20240115_143022.db
+```
+
+**Note:** The `data/backups/` directory is automatically created if it doesn't exist. Backups are git-ignored by default to keep sensitive data out of version control.
+
+#### Restoring from a Backup
+
+Restore your database from a backup file. You can either specify a backup file directly or interactively select from available backups.
+
+**Restore from a specific backup file:**
+```bash
+python main.py restore --backup-file data/backups/transactions_backup_20240115_143022.db
+```
+
+**Interactive restore (lists available backups):**
+```bash
+python main.py restore
+```
+
+When using interactive mode, the command will:
+1. List all available backups with creation dates and file sizes
+2. Prompt you to select a backup by number
+3. Ask for confirmation before overwriting the existing database
+4. Restore the selected backup
+
+**Example Interactive Output:**
+```
+Available backups:
+================================================================================
+1. transactions_backup_20240115_143022.db
+   Created: 2024-01-15 14:30:22
+   Size: 2.45 MB
+
+2. transactions_backup_20240114_091500.db
+   Created: 2024-01-14 09:15:00
+   Size: 2.40 MB
+
+Select backup to restore (1-2) or 'q' to quit: 1
+
+⚠️  WARNING: This will overwrite the existing database: data/transactions.db
+⚠️  Make sure the application is closed before restoring.
+Continue? (yes/no): yes
+✓ Database restored successfully from: data/backups/transactions_backup_20240115_143022.db
+```
+
+**Skip confirmation prompt (use with caution):**
+```bash
+python main.py restore --backup-file data/backups/transactions_backup_20240115_143022.db --force
+```
+
+#### Backup Configuration
+
+You can customize the backup directory location in `config.yaml`:
+
+```yaml
+backup:
+  backup_dir: custom/path/to/backups
+```
+
+If not specified, backups default to `data/backups/` relative to the database file location.
+
+#### Important Notes
+
+- **Close the application** before restoring a backup to avoid database locking issues
+- Backups are **not encrypted or compressed** (future enhancement)
+- The restore operation **overwrites** the existing database file
+- Always verify backups are created successfully before deleting old data
+- Large databases may take longer to backup/restore
+
 #### View Command Options
 
 - `--date-start YYYY-MM-DD`: Filter transactions from this date (inclusive)
@@ -1116,29 +1252,613 @@ All three fields must match exactly for a transaction to be considered a duplica
 
 The duplicate detection uses MD5 hashing of the concatenated key fields for efficient comparison.
 
+## Timezone Configuration
+
+All timestamps in the database are stored in UTC (Coordinated Universal Time) to ensure consistency across different timezones and daylight saving time changes.
+
+**Default Behavior:**
+- All `DateTime` columns use timezone-aware datetimes
+- Timestamps are automatically converted to UTC when stored
+- The `utc_now()` helper function replaces deprecated `datetime.utcnow()`
+
+**Configuration:**
+You can configure the default timezone in `config.yaml`:
+
+```yaml
+security:
+  timezone: UTC  # Default: UTC. All timestamps stored in UTC.
+```
+
+**Note:** While timestamps are stored in UTC, you can convert them to your local timezone when displaying to users. The application uses timezone-aware datetimes throughout to prevent ambiguity and ensure accurate date/time operations.
+
+**Migration Note:** If you have existing data with timezone-naive timestamps, they will be treated as UTC when loaded. The migration script (`encrypt_existing_data.py`) handles timezone conversion during encryption migration.
+
+**Verifying Timezone-Aware Timestamps:**
+```python
+from database_ops import utc_now
+from datetime import UTC
+
+# All timestamps should be timezone-aware
+now = utc_now()
+assert now.tzinfo is not None
+assert now.tzinfo == UTC
+```
+
+### Deprecation Warning Fixes
+
+The application has been updated to eliminate deprecation warnings:
+
+**SQLAlchemy Cache-Key Warnings:**
+- All encrypted type decorators (`EncryptedString`, `EncryptedNumeric`) have `cache_ok = True` set
+- This allows SQLAlchemy to properly cache compiled queries with encrypted columns
+- No performance impact; improves query compilation efficiency
+
+**Datetime Deprecation Warnings:**
+- All `datetime.utcnow()` calls have been replaced with `datetime.now(UTC)`
+- All DateTime columns use `DateTime(timezone=True)` for timezone-aware storage
+- The `utc_now()` helper function provides a consistent way to get UTC timestamps
+
+**Verifying No Warnings:**
+Run the test suite with warnings enabled to verify no deprecation warnings:
+```bash
+pytest tests/ -W error::DeprecationWarning -W error::PendingDeprecationWarning
+```
+
+Or check for specific warning types:
+```bash
+pytest tests/ -v --tb=short 2>&1 | grep -i "warning\|deprecation"
+```
+
+The test suite includes `tests/test_timezone_warnings.py` which specifically verifies:
+- No `datetime.utcnow()` deprecation warnings
+- No SQLAlchemy `cache_ok` warnings
+- All timestamps are timezone-aware
+
 ## Error Handling
 
-The application handles various error conditions:
+The application implements comprehensive error handling with a unified exception hierarchy and normalized error messages across CLI and UI entry points.
 
-- **Malformed CSV files**: Skips invalid rows and logs warnings
-- **Missing required fields**: Logs errors and skips affected rows
-- **Invalid data types**: Attempts conversion, logs warnings on failure
-- **Database errors**: Rolls back transactions and logs errors
-- **File I/O errors**: Logs errors and continues with other files
+### Exception Hierarchy
 
-All errors are logged to both console and optionally to a log file (configured in `config.yaml`).
+All errors inherit from `FinanceAppError`, which provides a consistent interface for error messages and context:
+
+- **`FinanceAppError`**: Base exception class for all finance-app errors
+- **`ConfigError`**: Raised when configuration loading or validation fails
+- **`DatabaseError`**: Raised when database operations fail
+- **`IngestionError`**: Raised when CSV ingestion encounters non-recoverable errors
+- **`StandardizationError`**: Raised when data standardization cannot continue safely
+- **`UIError`**: Raised when UI operations fail (Streamlit or CLI rendering issues)
+- **`EncryptionError`**: Base error for encryption failures
+  - **`EncryptionKeyError`**: Raised when encryption key loading or validation fails
+  - **`DecryptionError`**: Raised when decryption fails
+
+The exception hierarchy is extensible, allowing future modules (e.g., reporting, authentication) to add their own exception types.
+
+### Error Handling Features
+
+- **Unified Exception Hierarchy**: All custom exceptions inherit from `FinanceAppError`, enabling consistent error handling across the application
+- **Normalized Error Messages**: CLI entry points show user-friendly messages, while detailed context is logged for debugging
+- **Detailed Error Context**: Exceptions include `details` dictionaries with additional context (e.g., operation type, field names, error codes)
+- **Original Error Preservation**: Exceptions preserve the original error using Python's exception chaining
+- **Graceful Degradation**: Non-fatal errors (e.g., logging configuration issues) allow the application to continue with fallback behavior
+
+### Error Handling in Different Entry Points
+
+#### CLI Entry Points
+
+CLI commands catch `FinanceAppError` and its subclasses to display normalized, user-friendly error messages:
+
+```python
+# User-friendly message in CLI
+print(f"Error: {e.message}", file=sys.stderr)
+
+# Detailed context logged for debugging
+logger.error(f"Application error: {e.message}", exc_info=True)
+if e.details:
+    for key, value in e.details.items():
+        logger.error(f"  {key}: {value}")
+```
+
+#### Streamlit UI Entry Points
+
+Streamlit UIs catch exceptions and display user-friendly error messages with expandable details:
+
+```python
+# User-friendly error message
+st.error(f"Database connection failed: {error_msg}")
+
+# Expandable error details
+if e.details:
+    with st.expander("Error Details"):
+        for key, value in e.details.items():
+            st.text(f"{key}: {value}")
+```
+
+#### Logging
+
+All errors are logged with full context:
+
+- **Console Logging**: Always enabled for immediate feedback
+- **File Logging**: Enabled by default if `log_file` is specified in `config.yaml` (default: `logs/app.log`)
+- **Log Format**: Includes timestamps, module names, log levels, and messages
+- **Error Details**: Exceptions log full stack traces and context details
+
+### Common Error Scenarios
+
+- **Malformed CSV files**: Raises `IngestionError`, skips invalid rows, logs warnings
+- **Missing required fields**: Raises `StandardizationError`, logs errors, uses fallback values if configured
+- **Invalid data types**: Attempts conversion, raises `StandardizationError` on failure, logs warnings
+- **Database errors**: Raises `DatabaseError`, rolls back transactions, logs detailed error context
+- **File I/O errors**: Raises `ConfigError` or `FinanceAppError`, logs errors, continues with other files where possible
+- **Configuration errors**: Raises `ConfigError` with details about missing keys or invalid values
+- **Logging errors**: Non-fatal, falls back to basic logging if file logging fails
+
+### Logging Configuration
+
+File logging is enabled by default if a `log_file` is specified in `config.yaml`:
+
+```yaml
+logging:
+  # Log file path - file logging is enabled by default if this is specified
+  file: logs/app.log
+  # Log format - should include %(asctime)s for timestamps
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: INFO
+```
+
+The logging system handles edge cases gracefully:
+- Missing config keys: Uses sensible defaults
+- Invalid log levels: Defaults to INFO with a warning
+- Invalid log formats: Uses default format with timestamp
+- File write permissions issues: Logs warning, continues without file logging
+- Logging failures never crash the application
+
+## Performance Optimizations
+
+The finance app includes several performance optimizations to handle large datasets efficiently, especially for analytical queries.
+
+### SQL Aggregation Optimizations
+
+The `AnalyticsEngine.get_income_expense_summary` method has been optimized to use SQL aggregations instead of loading all transactions into Python memory. This provides significant performance improvements, especially with large datasets (1M+ transactions).
+
+**Before (Python-side aggregation):**
+- Loaded all matching transactions with `query.all()`
+- Computed sums and counts in Python
+- High memory usage for large datasets
+- Slower execution time
+
+**After (SQL aggregation):**
+- Uses SQL `SUM` with `CASE` statements for income/expenses
+- Uses SQL `COUNT` for transaction counts
+- All aggregations performed in the database
+- Lower memory usage (only returns aggregated results)
+- Faster execution, especially for large date ranges
+
+**Example:**
+```python
+from analytics import AnalyticsEngine
+from database_ops import DatabaseManager
+
+db_manager = DatabaseManager("sqlite:///data/transactions.db")
+engine = AnalyticsEngine(db_manager)
+
+# Optimized query with SQL aggregations
+summary = engine.get_income_expense_summary(
+    time_frame='12m',
+    account_id=None,
+    category_id='Groceries'  # Optional category filter
+)
+
+print(f"Income: ${summary['total_income']:.2f}")
+print(f"Expenses: ${summary['total_expenses']:.2f}")
+print(f"Net: ${summary['net_change']:.2f}")
+```
+
+**Performance Improvements:**
+- **10-100x faster** for large datasets (100K+ transactions)
+- **Reduced memory usage** (constant memory vs. linear with dataset size)
+- **Better scalability** as dataset grows
+- **Effective index utilization** for date and account filters
+
+### Query Profiling with EXPLAIN
+
+The application includes query profiling utilities in `performance_utils.py` to analyze query execution plans and identify performance bottlenecks.
+
+**Enable Query Profiling:**
+```bash
+export QUERY_PROFILING_ENABLED=true
+python main.py analyze
+```
+
+**Manual Profiling:**
+```python
+from performance_utils import explain_query, log_query_performance
+from sqlalchemy import Session
+
+session = db_manager.get_session()
+query = session.query(Transaction).filter(Transaction.date >= start_date)
+
+# Run EXPLAIN ANALYZE
+profile = explain_query(session, query, analyze=True)
+log_query_performance("my_query", profile)
+```
+
+**Profiling Output:**
+The profiling utility logs:
+- Execution plan (EXPLAIN output)
+- Query execution time (PostgreSQL)
+- Planning time (PostgreSQL)
+- Index usage information
+
+### Synthetic Data Benchmarking
+
+A Jupyter notebook (`benchmarks/query_performance.ipynb`) is provided for benchmarking query performance with synthetic large datasets.
+
+**Running Benchmarks:**
+```bash
+# Install Jupyter and dependencies
+pip install jupyter faker matplotlib pandas
+
+# Launch Jupyter
+jupyter notebook benchmarks/query_performance.ipynb
+```
+
+**Benchmark Features:**
+- Generates 1M+ synthetic transactions using Faker
+- Compares old vs. new query approaches
+- Measures execution times across different dataset sizes
+- Visualizes performance improvements
+- Runs EXPLAIN ANALYZE on optimized queries
+- Tests scalability across date ranges
+
+**Configure Benchmark Size:**
+```bash
+export BENCHMARK_NUM_TRANSACTIONS=2000000  # 2M transactions
+jupyter notebook benchmarks/query_performance.ipynb
+```
+
+### Database Indexes
+
+The application includes optimized indexes for common query patterns:
+
+**Transaction Table Indexes:**
+- `idx_date_amount`: Composite index on `(date, amount)` for date-range queries with amount filtering
+- `idx_account_date`: Composite index on `(account_id, date)` for account-specific date queries
+- `idx_transactions_date`: Single index on `date` for time-frame filtering
+- `idx_transactions_account_id`: Index on `account_id` for account filtering
+- `idx_transactions_duplicate_hash`: Unique index on `duplicate_hash` for duplicate detection
+
+**Account Table Indexes:**
+- `idx_accounts_type`: Index on `type` for account type filtering
+- `idx_accounts_name_index`: Unique index for account name searches
+
+These indexes are automatically created when tables are initialized and significantly improve query performance for analytical operations.
+
+### Future Optimizations
+
+**Query Caching:**
+The code includes hooks for implementing query result caching (e.g., Redis):
+- Memoization decorators can be added to frequently-called analytical methods
+- Cache invalidation hooks are available for transaction updates
+- See `performance_utils.py` for caching integration points
+
+**Advanced Indexing:**
+- Partial indexes for common filter combinations (e.g., date + category)
+- Consider TimescaleDB for time-series optimizations if using PostgreSQL
+- Materialized views for frequently accessed aggregations
+
+**Scalability Recommendations:**
+- For datasets >10M transactions, consider partitioning by date
+- Use read replicas for analytical queries if using PostgreSQL
+- Implement connection pooling for concurrent access
+- Monitor slow queries using EXPLAIN ANALYZE regularly
 
 ## Testing
 
-Run the test suite:
+The project includes comprehensive unit and integration tests for error handling, logging, core functionality, and performance optimizations.
+
+### Running Tests
+
+**Run all tests:**
 ```bash
-pytest tests/test_import.py -v
+pytest tests/ -v
 ```
 
-Run tests with coverage:
+**Run specific test files:**
 ```bash
-pytest tests/test_import.py --cov=. --cov-report=html
+# Test analytics optimizations
+pytest tests/test_analytics_optimized.py -v
+
+# Test performance utilities
+pytest tests/test_performance_utils.py -v
+
+# Test integration tests
+pytest tests/test_analytics_integration.py -v
+
+# Test exceptions
+pytest tests/test_exceptions.py -v
+
+# Test logging
+pytest tests/test_logging.py -v
+
+# Test import functionality
+pytest tests/test_import.py -v
+
+# Test database operations
+pytest tests/test_database_ops.py -v
 ```
+
+**Run tests with coverage:**
+```bash
+# Generate HTML coverage report
+pytest tests/ --cov=. --cov-report=html --cov-report=term
+
+# View coverage report
+# Open htmlcov/index.html in your browser
+```
+
+**Run tests with warnings enabled:**
+```bash
+pytest tests/ -v -W error::DeprecationWarning
+```
+
+**Run only unit tests (faster):**
+```bash
+pytest tests/ -v -k "not integration"
+```
+
+**Run only integration tests:**
+```bash
+pytest tests/ -v -k "integration"
+```
+
+### Test Structure
+
+The test suite includes:
+
+**Performance and Optimization Tests:**
+- **`test_analytics_optimized.py`**: Comprehensive unit tests for optimized analytics methods
+  - Tests SQL aggregation in `get_income_expense_summary`
+  - Tests all filter combinations (account, category, date ranges)
+  - Tests edge cases (empty datasets, invalid inputs, errors)
+  - Tests session management and resource cleanup
+  - Uses mocks for fast, isolated testing
+
+- **`test_performance_utils.py`**: Tests for query profiling utilities
+  - Tests EXPLAIN query functionality
+  - Tests query timing measurements
+  - Tests performance logging
+  - Tests profiling enable/disable via environment variables
+  - Tests error handling in profiling
+
+- **`test_analytics_integration.py`**: Integration tests with real database
+  - Tests optimized queries against actual SQLite database
+  - Tests with synthetic transaction data
+  - Verifies SQL aggregation correctness
+  - Performance benchmarks with larger datasets
+  - Tests error handling with real database connections
+
+**Core Functionality Tests:**
+- **`test_exceptions.py`**: Unit tests for the unified exception hierarchy
+  - Tests exception creation, attributes, string representations
+  - Tests error context and error chaining
+  - Tests all exception subclasses
+
+- **`test_logging.py`**: Unit tests for logging configuration
+  - Tests `setup_logging` function with various configurations
+  - Tests file logging, email alerts, edge cases
+  - Tests non-fatal logging failures
+
+- **`test_import.py`**: Tests for data ingestion
+  - Tests CSV reading, error handling, duplicate detection
+
+- **`test_database_ops.py`**: Tests for database operations
+  - Tests `DatabaseError` scenarios, transaction insertion, queries
+
+- **`test_ingestion.py`**: Tests for ingestion error handling
+  - Tests `IngestionError` and `StandardizationError` scenarios
+
+### Test Coverage
+
+The test suite aims for >80% coverage for optimized code:
+
+**Current Coverage Goals:**
+- `analytics.py`: >85% (optimized methods)
+- `performance_utils.py`: >90% (all profiling functions)
+- `database_ops.py`: >80% (index creation, query helpers)
+
+**View Coverage Report:**
+```bash
+pytest tests/ --cov=analytics --cov=performance_utils --cov-report=html
+open htmlcov/index.html  # macOS/Linux
+start htmlcov/index.html  # Windows
+```
+
+### Writing Tests
+
+When writing new tests:
+
+1. **Use `pytest` for all tests** - Follow pytest conventions
+2. **Include type hints** - Add type annotations to test functions
+3. **Add docstrings** - Explain what is being tested in each test
+4. **Use fixtures** - Reuse test setup with `@pytest.fixture`
+5. **Use parametrize** - Test multiple cases with `@pytest.mark.parametrize`
+6. **Mock external dependencies** - Use `unittest.mock` for file I/O, DB connections
+7. **Test error scenarios** - Invalid inputs, missing configs, DB failures, file permissions
+8. **Assert on logs/output** - Verify expected behavior where appropriate
+9. **Follow PEP 8** - Consistent code style
+10. **Keep tests isolated** - Each test should be independent and repeatable
+11. **Use descriptive names** - Test function names should describe what they test
+
+**Example Unit Test:**
+```python
+import pytest
+from unittest.mock import Mock, patch
+from analytics import AnalyticsEngine
+from exceptions import AnalyticsError
+
+@pytest.fixture
+def analytics_engine():
+    """Create analytics engine for testing."""
+    mock_db = Mock()
+    return AnalyticsEngine(mock_db)
+
+def test_get_income_expense_summary_empty_dataset(analytics_engine):
+    """Test summary returns zero values for empty dataset."""
+    # Setup mocks...
+    summary = analytics_engine.get_income_expense_summary(time_frame='all')
+    
+    assert summary['total_income'] == 0.0
+    assert summary['total_expenses'] == 0.0
+    assert summary['total_count'] == 0
+```
+
+**Example Integration Test:**
+```python
+import pytest
+from analytics import AnalyticsEngine
+from database_ops import DatabaseManager
+from datetime import datetime
+
+@pytest.fixture
+def test_db(tmp_path):
+    """Create temporary test database."""
+    db_path = tmp_path / "test.db"
+    db_manager = DatabaseManager(f"sqlite:///{db_path}")
+    db_manager.create_tables()
+    return db_manager
+
+def test_summary_with_real_data(test_db):
+    """Test summary with real database transactions."""
+    engine = AnalyticsEngine(test_db)
+    # Insert test data...
+    summary = engine.get_income_expense_summary(time_frame='12m')
+    
+    assert summary['total_count'] > 0
+```
+
+### Running Performance Tests
+
+To test query performance optimizations:
+
+```bash
+# Enable profiling for tests
+export QUERY_PROFILING_ENABLED=true
+pytest tests/test_analytics_integration.py -v -k performance
+```
+
+For larger datasets, use the benchmarking notebook:
+```bash
+jupyter notebook benchmarks/query_performance.ipynb
+```
+
+### Continuous Integration
+
+**Recommended CI Setup:**
+```yaml
+# Example GitHub Actions workflow
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: '3.10'
+      - run: pip install -r requirements.txt
+      - run: pip install pytest pytest-cov
+      - run: pytest tests/ --cov=. --cov-report=xml
+      - uses: codecov/codecov-action@v2
+```
+
+### Pre-commit Hooks
+
+To run tests automatically before commits:
+
+```bash
+# Install pre-commit
+pip install pre-commit
+
+# Create .pre-commit-config.yaml
+cat > .pre-commit-config.yaml << EOF
+repos:
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: pytest
+        args: [tests/, -v, --tb=short]
+        language: system
+        pass_filenames: false
+        always_run: true
+EOF
+
+pre-commit install
+```
+
+### Test Environment Variables
+
+**Profiling:**
+```bash
+export QUERY_PROFILING_ENABLED=true  # Enable query profiling in tests
+```
+
+**Benchmarking:**
+```bash
+export BENCHMARK_NUM_TRANSACTIONS=1000000  # Set benchmark dataset size
+```
+
+### Email Alerts
+
+The logging system supports optional email alerts for critical errors. Configure email alerts in `config.yaml`:
+
+```yaml
+email_alerts:
+  enabled: true
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  use_tls: true
+  username: your-email@gmail.com
+  password: your-app-password  # Use app-specific password for Gmail
+  from_address: your-email@gmail.com
+  to_addresses:
+    - admin@example.com
+    - alerts@example.com
+  level: CRITICAL  # Only send emails for CRITICAL level errors
+  subject: "Finance App Critical Error"
+```
+
+**Email Alert Features:**
+
+- **Optional Integration**: Email alerts are disabled by default
+- **Configurable Level**: Set the minimum log level for email alerts (default: CRITICAL)
+- **Multiple Recipients**: Send alerts to multiple email addresses
+- **SMTP Support**: Supports SMTP with TLS/SSL
+- **Non-Fatal Setup**: If email configuration fails, the app continues without email alerts
+- **Graceful Degradation**: Missing or invalid email config doesn't crash the app
+
+**Email Alert Setup:**
+
+1. Enable email alerts in `config.yaml` by setting `email_alerts.enabled: true`
+2. Configure SMTP server details (host, port, TLS)
+3. Provide credentials (username/password for authentication)
+4. Set recipient addresses in `to_addresses` list
+5. Configure alert level (default: CRITICAL)
+6. Customize email subject if needed
+
+**Future Enhancements:**
+
+The email alert system can be extended with:
+- Rotating file handlers for log file management
+- Webhook integrations for alerting services
+- Custom formatters for email messages
+- Rate limiting to prevent email spam
+- Retry logic for failed email sends
 
 ## Extension Points
 

@@ -10,7 +10,7 @@ import logging
 import re
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Iterable
-from datetime import datetime, date
+from datetime import UTC, datetime, date
 
 from database_ops import DatabaseManager, Account, AccountType
 from sqlalchemy.exc import SQLAlchemyError
@@ -125,7 +125,11 @@ class AccountManager:
             # Check if account with same name exists
             existing = self.db_manager.get_account_by_name(name, session=session)
             if existing:
-                raise ValueError(f"Account with name '{name}' already exists")
+                from exceptions import AccountError
+                raise AccountError(
+                    f"Account with name '{name}' already exists",
+                    details={"account_name": name, "existing_account_id": existing.id}
+                )
             
             # Create new account
             account = Account(
@@ -335,7 +339,11 @@ class AccountManager:
                 # Check if new name conflicts with existing account
                 existing = self.db_manager.get_account_by_name(name, session=session)
                 if existing and existing.id != account_id:
-                    raise ValueError(f"Account with name '{name}' already exists")
+                    from exceptions import AccountError
+                    raise AccountError(
+                        f"Account with name '{name}' already exists",
+                        details={"account_name": name, "existing_account_id": existing.id, "update_account_id": account_id}
+                    )
                 account.name = name
             
             if account_type is not None:
@@ -344,8 +352,10 @@ class AccountManager:
             if balance is not None:
                 account.balance = balance
             
-            account.updated_at = datetime.utcnow()
+            account.updated_at = datetime.now(UTC)
             session.commit()
+            session.refresh(account)
+            session.expunge(account)
             
             logger.info(f"Updated account {account_id}")
             return account
@@ -460,7 +470,7 @@ class AccountManager:
             
             # Get recent transactions count (last 30 days)
             from datetime import timedelta
-            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+            thirty_days_ago = datetime.now(UTC) - timedelta(days=30)
             recent_count = session.query(Transaction).filter(
                 Transaction.account_id == account_id,
                 Transaction.date >= thirty_days_ago
@@ -525,7 +535,7 @@ class AccountManager:
             history_entry = BalanceHistory(
                 account_id=account_id,
                 balance=new_balance,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(UTC),
                 notes=notes
             )
             session.add(history_entry)
@@ -664,7 +674,7 @@ class AccountManager:
                 account_id=account_id,
                 override_date=override_date,
                 override_balance=override_balance,
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(UTC),
                 notes=notes
             )
             session.add(override)
@@ -726,7 +736,8 @@ class AccountManager:
                 )
                 
                 # Sum transactions after override date and up to as_of_date
-                transaction_sum = session.query(func.sum(Transaction.amount)).filter(
+                amount_expr = func.decrypt_numeric(Transaction.amount)
+                transaction_sum = session.query(func.sum(amount_expr)).filter(
                     Transaction.account_id == account_id,
                     Transaction.date > override.override_date,
                     Transaction.date <= as_of_date
@@ -742,7 +753,8 @@ class AccountManager:
                 # No override, sum all transactions up to as_of_date
                 logger.debug(f"No override found for account {account_id}, summing all transactions")
                 
-                transaction_sum = session.query(func.sum(Transaction.amount)).filter(
+                amount_expr = func.decrypt_numeric(Transaction.amount)
+                transaction_sum = session.query(func.sum(amount_expr)).filter(
                     Transaction.account_id == account_id,
                     Transaction.date <= as_of_date
                 ).scalar() or 0.0

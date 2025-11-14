@@ -7,12 +7,13 @@ allocate funds to categories and track spending against budgets.
 
 import logging
 from typing import List, Optional, Dict, Any, Tuple, Set
-from datetime import datetime, date, timedelta
+from datetime import UTC, datetime, date, timedelta
 from dataclasses import dataclass
 
 from database_ops import DatabaseManager, Budget, Transaction, IncomeOverride, Account
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func, and_, extract
+from exceptions import BudgetError
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -261,7 +262,7 @@ class BudgetManager:
                 existing.allocated_amount = allocated_amount
                 existing.period_start = period_start_dt
                 existing.period_end = period_end_dt
-                existing.updated_at = datetime.utcnow()
+                existing.updated_at = datetime.now(UTC)
                 session.commit()
                 session.refresh(existing)
                 session.expunge(existing)
@@ -315,16 +316,17 @@ class BudgetManager:
                 return None
             category_key = self._category_key(normalized_category)
             
-            budget = session.query(Budget).filter(
-                func.lower(Budget.category) == category_key,
+            candidates = session.query(Budget).filter(
                 Budget.period_start <= period_datetime,
                 Budget.period_end >= period_datetime
-            ).first()
+            ).all()
             
-            if budget:
-                session.refresh(budget)
-                session.expunge(budget)
-            return budget
+            for budget in candidates:
+                existing_key = self._category_key(self._normalize_category(budget.category))
+                if existing_key == category_key:
+                    session.expunge(budget)
+                    return budget
+            return None
         except SQLAlchemyError as e:
             logger.error(f"Failed to get budget: {e}")
             return None
@@ -399,9 +401,11 @@ class BudgetManager:
             start_datetime = datetime.combine(period_start, datetime.min.time())
             end_datetime = datetime.combine(period_end, datetime.max.time())
             
+            category_expr = func.lower(func.trim(func.decrypt_text(Transaction.category)))
+            amount_expr = func.decrypt_numeric(Transaction.amount)
             query = session.query(
-                func.lower(func.trim(Transaction.category)).label("category_key"),
-                func.sum(Transaction.amount).label("total")
+                category_expr.label("category_key"),
+                func.sum(amount_expr).label("total")
             ).filter(
                 Transaction.date >= start_datetime,
                 Transaction.date <= end_datetime,
@@ -418,9 +422,7 @@ class BudgetManager:
                 mapped_keys = {alias_lookup.get(k, k) for k in category_keys}
                 include_keys = category_keys.union(mapped_keys)
                 if include_keys:
-                    query = query.filter(
-                        func.lower(func.trim(Transaction.category)).in_(include_keys)
-                    )
+                    query = query.filter(category_expr.in_(include_keys))
             
             results = query.group_by("category_key").all()
             activity_map: Dict[str, float] = {}
@@ -453,7 +455,7 @@ class BudgetManager:
         if categories:
             query = query.filter(
                 Transaction.category.isnot(None),
-                func.lower(Transaction.category).in_(categories)
+                func.lower(func.decrypt_text(Transaction.category)).in_(categories)
             )
         return query
     
@@ -472,14 +474,18 @@ class BudgetManager:
             start_datetime = datetime.combine(period_start, datetime.min.time())
             end_datetime = datetime.combine(period_end, datetime.max.time())
             
-            query = session.query(func.sum(Transaction.amount)).filter(
+            amount_expr = func.decrypt_numeric(Transaction.amount)
+            query = session.query(func.sum(amount_expr)).filter(
                 Transaction.date >= start_datetime,
                 Transaction.date <= end_datetime,
                 Transaction.is_transfer == 0
             )
             
             if positive_only and negative_only:
-                raise ValueError("positive_only and negative_only cannot both be True")
+                raise BudgetError(
+                    "positive_only and negative_only cannot both be True",
+                    details={"operation": "get_budget_status"}
+                )
             
             if positive_only:
                 query = query.filter(Transaction.amount > 0)
@@ -531,7 +537,7 @@ class BudgetManager:
                 override.override_amount = amount
                 override.period_end = period_end
                 override.notes = notes
-                override.updated_at = datetime.utcnow()
+                override.updated_at = datetime.now(UTC)
             else:
                 override = IncomeOverride(
                     period_start=period_start,
@@ -880,7 +886,7 @@ class BudgetManager:
             if period_end is not None:
                 budget.period_end = datetime.combine(period_end, datetime.max.time())
             
-            budget.updated_at = datetime.utcnow()
+            budget.updated_at = datetime.now(UTC)
             session.commit()
             session.refresh(budget)
             session.expunge(budget)
@@ -971,13 +977,16 @@ class BudgetManager:
         try:
             canonical_labels, alias_lookup, _ = self._load_budget_category_aliases()
             
-            raw_categories = session.query(
+            query = session.query(
                 func.trim(Transaction.category)
-            ).filter(
+            )
+            query = query.filter(
                 Transaction.category.isnot(None),
                 func.trim(Transaction.category) != "",
                 Transaction.is_transfer == 0
-            ).distinct().all()
+            )
+            query = query.distinct()
+            raw_categories = query.all()
             
             canonical_set: Dict[str, str] = {}
             for (category,) in raw_categories:

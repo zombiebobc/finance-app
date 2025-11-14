@@ -343,15 +343,36 @@ class CLIAnalytics:
 
 def main_cli_analytics(connection_string: str, args: argparse.Namespace) -> None:
     """
-    Main entry point for CLI analytics.
+    Main entry point for CLI analytics with top-level error handling.
     
     Args:
         connection_string: Database connection string
         args: Parsed command-line arguments
     """
-    # Initialize database and analytics
-    db_manager = DatabaseManager(connection_string)
-    cli_analytics = CLIAnalytics(db_manager)
+    from exceptions import FinanceAppError, DatabaseError, ConfigError, AnalyticsError, ReportError
+    
+    # Initialize database and analytics with error handling
+    try:
+        db_manager = DatabaseManager(connection_string)
+        cli_analytics = CLIAnalytics(db_manager)
+    except DatabaseError as e:
+        # User-friendly error message for CLI
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        logger.error(f"Database error: {error_msg}", exc_info=True)
+        print(f"Database connection error: {error_msg}", file=sys.stderr)
+        if e.details:
+            for key, value in e.details.items():
+                logger.error(f"  {key}: {value}")
+        sys.exit(1)
+    except (ConfigError, FinanceAppError) as e:
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        logger.error(f"Configuration error: {error_msg}", exc_info=True)
+        print(f"Configuration error: {error_msg}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(f"Unexpected error connecting to database: {e}")
+        print(f"Unexpected error connecting to database: {e}", file=sys.stderr)
+        sys.exit(1)
     
     try:
         # Route to appropriate report based on args
@@ -405,6 +426,30 @@ def main_cli_analytics(connection_string: str, args: argparse.Namespace) -> None
             print(f"Unknown report type: {args.report_type}", file=sys.stderr)
             sys.exit(1)
     
+    except (AnalyticsError, ReportError, DatabaseError) as e:
+        # Normalize error messages for CLI
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        logger.error(f"Analytics error: {error_msg}", exc_info=True)
+        if e.details:
+            for key, value in e.details.items():
+                logger.error(f"  {key}: {value}")
+        print(f"Error generating report: {error_msg}", file=sys.stderr)
+        sys.exit(1)
+    except FinanceAppError as e:
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        logger.error(f"Application error: {error_msg}", exc_info=True)
+        print(f"Error: {error_msg}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("CLI analytics interrupted by user")
+        print("\nAnalytics interrupted by user.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        # Unexpected error - log full details, show user-friendly message
+        logger.exception(f"Unexpected error in CLI analytics: {e}")
+        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        print("Check the logs for details.", file=sys.stderr)
+        sys.exit(1)
     finally:
         db_manager.close()
 

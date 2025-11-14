@@ -177,10 +177,12 @@ def build_filters(args: argparse.Namespace) -> Dict[str, Any]:
         filters["category"] = args.category
     if args.source_file:
         filters["source_file"] = args.source_file
-    if args.account_id is not None:
-        filters["account_id"] = args.account_id
-    if args.account_name:
-        filters["account_name"] = args.account_name
+    account_id = getattr(args, "account_id", None)
+    if account_id is not None:
+        filters["account_id"] = account_id
+    account_name = getattr(args, "account_name", None)
+    if account_name:
+        filters["account_name"] = account_name
     
     return filters
 
@@ -316,21 +318,38 @@ def display_stats(viewer: DataViewer, filters: Optional[Dict[str, Any]] = None) 
 
 def main_cli_viewer(connection_string: str, args: Optional[argparse.Namespace] = None) -> None:
     """
-    Main entry point for CLI viewer.
+    Main entry point for CLI viewer with top-level error handling.
     
     Args:
         connection_string: Database connection string
         args: Optional parsed arguments (if None, will parse from command line)
     """
+    from exceptions import FinanceAppError, DatabaseError, ConfigError, ViewerError
+    
     if args is None:
         args = parse_cli_args()
     
-    # Initialize database and viewer
+    # Initialize database and viewer with error handling
     try:
         db_manager = DatabaseManager(connection_string)
         viewer = DataViewer(db_manager)
+    except DatabaseError as e:
+        # User-friendly error message for CLI
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        logger.error(f"Database error: {error_msg}", exc_info=True)
+        print(f"Database connection error: {error_msg}", file=sys.stderr)
+        if e.details:
+            for key, value in e.details.items():
+                logger.error(f"  {key}: {value}")
+        sys.exit(1)
+    except (ConfigError, FinanceAppError) as e:
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        logger.error(f"Configuration error: {error_msg}", exc_info=True)
+        print(f"Configuration error: {error_msg}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"Error connecting to database: {e}", file=sys.stderr)
+        logger.exception(f"Unexpected error connecting to database: {e}")
+        print(f"Unexpected error connecting to database: {e}", file=sys.stderr)
         sys.exit(1)
     
     try:
@@ -364,16 +383,43 @@ def main_cli_viewer(connection_string: str, args: Optional[argparse.Namespace] =
                 )
                 viewer.export_to_csv(df, args.export)
                 print(f"\nExported {len(df)} transactions to {args.export}")
+            except (ViewerError, FinanceAppError) as e:
+                error_msg = e.message if hasattr(e, 'message') else str(e)
+                logger.error(f"Export error: {error_msg}", exc_info=True)
+                print(f"Error exporting to CSV: {error_msg}", file=sys.stderr)
+                sys.exit(1)
             except Exception as e:
-                print(f"\nError exporting to CSV: {e}", file=sys.stderr)
+                logger.exception(f"Unexpected error exporting: {e}")
+                print(f"Error exporting to CSV: {e}", file=sys.stderr)
                 sys.exit(1)
         
-    except ValueError as e:
-        print(f"\nInvalid filter: {e}", file=sys.stderr)
+    except (ViewerError, DatabaseError) as e:
+        # Normalize error messages for CLI
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        logger.error(f"Viewer error: {error_msg}", exc_info=True)
+        if e.details:
+            for key, value in e.details.items():
+                logger.error(f"  {key}: {value}")
+        print(f"Error: {error_msg}", file=sys.stderr)
         sys.exit(1)
+    except ValueError as e:
+        logger.warning(f"Invalid filter: {e}")
+        print(f"Invalid filter: {e}", file=sys.stderr)
+        sys.exit(1)
+    except FinanceAppError as e:
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        logger.error(f"Application error: {error_msg}", exc_info=True)
+        print(f"Error: {error_msg}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("CLI viewer interrupted by user")
+        print("\nViewer interrupted by user.", file=sys.stderr)
+        sys.exit(130)
     except Exception as e:
-        logger.error(f"Error in CLI viewer: {e}", exc_info=True)
-        print(f"\nError: {e}", file=sys.stderr)
+        # Unexpected error - log full details, show user-friendly message
+        logger.exception(f"Unexpected error in CLI viewer: {e}")
+        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        print("Check the logs for details.", file=sys.stderr)
         sys.exit(1)
     finally:
         db_manager.close()

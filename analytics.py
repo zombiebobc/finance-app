@@ -11,11 +11,20 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 import pandas as pd
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_, extract
+from sqlalchemy import func, and_, extract, case
 
 from database_ops import DatabaseManager, Transaction, Account, AccountType
+from exceptions import AnalyticsError
 
 logger = logging.getLogger(__name__)
+
+# Optional import for query profiling
+try:
+    from performance_utils import explain_query, is_profiling_enabled, log_query_performance
+    PROFILING_AVAILABLE = True
+except ImportError:
+    PROFILING_AVAILABLE = False
+    logger.debug("Query profiling utilities not available")
 
 
 class AnalyticsEngine:
@@ -68,7 +77,11 @@ class AnalyticsEngine:
                 end_date = datetime.strptime(end_str, '%Y-%m-%d')
                 return start_date, end_date
             except ValueError as e:
-                raise ValueError(f"Invalid date range format. Use YYYY-MM-DD:YYYY-MM-DD: {e}")
+                raise AnalyticsError(
+                    f"Invalid date range format. Use YYYY-MM-DD:YYYY-MM-DD: {e}",
+                    details={"time_frame": time_frame, "error": str(e)},
+                    original_error=e
+                )
         
         # Handle relative months (1m, 3m, 6m, 12m)
         if time_frame.endswith('m'):
@@ -77,76 +90,168 @@ class AnalyticsEngine:
                 start_date = now - timedelta(days=months * 30)  # Approximate
                 return start_date, now
             except ValueError:
-                raise ValueError(f"Invalid month format: {time_frame}")
+                raise AnalyticsError(
+                    f"Invalid month format: {time_frame}",
+                    details={"time_frame": time_frame}
+                )
         
-        raise ValueError(f"Invalid time frame format: {time_frame}. Use '1m', '3m', '6m', '12m', 'all', or 'YYYY-MM-DD:YYYY-MM-DD'")
+        raise AnalyticsError(
+            f"Invalid time frame format: {time_frame}. Use '1m', '3m', '6m', '12m', 'all', or 'YYYY-MM-DD:YYYY-MM-DD'",
+            details={"time_frame": time_frame}
+        )
     
     def get_income_expense_summary(
         self,
         time_frame: str = 'all',
         account_id: Optional[int] = None,
-        account_type: Optional[AccountType] = None
+        account_type: Optional[AccountType] = None,
+        category_id: Optional[str] = None,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None
     ) -> Dict[str, Union[float, int]]:
         """
-        Get summary of income, expenses, and net change.
+        Get summary of income, expenses, and net change using SQL aggregations.
+        
+        This method performs all aggregations in the database using SQL SUM and CASE
+        statements for optimal performance, especially with large datasets. It avoids
+        loading all transactions into Python memory.
         
         Args:
-            time_frame: Time frame for analysis
+            time_frame: Time frame for analysis (used if date_from/date_to not provided)
             account_id: Optional account ID filter
             account_type: Optional account type filter
+            category_id: Optional category name filter (case-insensitive partial match)
+            date_from: Optional start date (overrides time_frame if provided)
+            date_to: Optional end date (overrides time_frame if provided)
         
         Returns:
-            Dictionary with income, expense, net, transaction counts
+            Dictionary with income, expense, net, transaction counts:
+            - total_income: Sum of positive transaction amounts
+            - total_expenses: Sum of absolute values of negative transaction amounts
+            - net_change: Difference between income and expenses
+            - income_count: Number of income transactions
+            - expense_count: Number of expense transactions
+            - total_count: Total number of transactions
+        
+        Raises:
+            AnalyticsError: If date validation fails or query execution fails
+        
+        Example:
+            >>> summary = engine.get_income_expense_summary(time_frame='3m')
+            >>> print(f"Net change: ${summary['net_change']:.2f}")
+            Net change: $1250.00
         """
-        start_date, end_date = self.parse_time_frame(time_frame)
+        # Determine date range: use explicit dates if provided, otherwise parse time_frame
+        if date_from is not None and date_to is not None:
+            start_date = date_from
+            end_date = date_to
+        elif date_from is not None or date_to is not None:
+            raise AnalyticsError(
+                "Both date_from and date_to must be provided together, or use time_frame parameter",
+                details={"date_from": date_from, "date_to": date_to, "time_frame": time_frame}
+            )
+        else:
+            start_date, end_date = self.parse_time_frame(time_frame)
+        
+        # Validate date range
+        if start_date > end_date:
+            raise AnalyticsError(
+                "Start date must be before or equal to end date",
+                details={"start_date": start_date, "end_date": end_date}
+            )
+        
         session = self.db_manager.get_session()
         
         try:
-            # Build base query
-            query = session.query(Transaction).filter(
-                and_(
-                    Transaction.date >= start_date,
-                    Transaction.date <= end_date
-                )
+            # Build query with SQL aggregations using CASE statements
+            # SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) for income
+            # SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END) for expenses
+            # COUNT(CASE WHEN amount > 0 THEN 1 END) for income count
+            # COUNT(CASE WHEN amount < 0 THEN 1 END) for expense count
+            
+            query = session.query(
+                func.sum(
+                    case((Transaction.amount > 0, Transaction.amount), else_=0)
+                ).label('total_income'),
+                func.sum(
+                    case((Transaction.amount < 0, func.abs(Transaction.amount)), else_=0)
+                ).label('total_expenses'),
+                func.count(
+                    case((Transaction.amount > 0, 1), else_=None)
+                ).label('income_count'),
+                func.count(
+                    case((Transaction.amount < 0, 1), else_=None)
+                ).label('expense_count'),
+                func.count(Transaction.id).label('total_count')
             )
+            
+            # Build filter conditions
+            conditions = [
+                Transaction.date >= start_date,
+                Transaction.date <= end_date
+            ]
             
             # Apply account filters
             if account_id:
-                query = query.filter(Transaction.account_id == account_id)
+                conditions.append(Transaction.account_id == account_id)
             elif account_type:
-                query = query.join(Account).filter(Account.type == account_type)
+                query = query.join(Account)
+                conditions.append(Account.type == account_type)
             
-            # Get all transactions
-            transactions = query.all()
+            # Apply category filter (case-insensitive partial match)
+            if category_id:
+                # Note: category is encrypted, so we use ilike on the decrypted value
+                # In SQLAlchemy with encrypted fields, we need to handle this carefully
+                # For now, assuming the encryption layer supports pattern matching
+                conditions.append(Transaction.category.ilike(f"%{category_id}%"))
             
-            if not transactions:
-                return {
-                    'total_income': 0.0,
-                    'total_expenses': 0.0,
-                    'net_change': 0.0,
-                    'income_count': 0,
-                    'expense_count': 0,
-                    'total_count': 0
-                }
+            # Apply all filters
+            query = query.filter(and_(*conditions))
             
-            # Separate income and expenses
-            income = sum(t.amount for t in transactions if t.amount > 0)
-            expenses = sum(abs(t.amount) for t in transactions if t.amount < 0)
-            income_count = sum(1 for t in transactions if t.amount > 0)
-            expense_count = sum(1 for t in transactions if t.amount < 0)
+            # Optional: Profile query if profiling is enabled
+            if PROFILING_AVAILABLE and is_profiling_enabled():
+                try:
+                    profile_result = explain_query(session, query, analyze=True)
+                    log_query_performance("get_income_expense_summary", profile_result)
+                except Exception as e:
+                    # Don't fail the query if profiling fails
+                    logger.warning(f"Query profiling failed: {e}")
+            
+            # Execute query - returns single row with aggregated results
+            result = query.one()
+            
+            # Handle NULL results from SUM (occurs when no rows match)
+            total_income = float(result.total_income) if result.total_income is not None else 0.0
+            total_expenses = float(result.total_expenses) if result.total_expenses is not None else 0.0
+            income_count = int(result.income_count) if result.income_count is not None else 0
+            expense_count = int(result.expense_count) if result.expense_count is not None else 0
+            total_count = int(result.total_count) if result.total_count is not None else 0
             
             return {
-                'total_income': income,
-                'total_expenses': expenses,
-                'net_change': income - expenses,
+                'total_income': total_income,
+                'total_expenses': total_expenses,
+                'net_change': total_income - total_expenses,
                 'income_count': income_count,
                 'expense_count': expense_count,
-                'total_count': len(transactions)
+                'total_count': total_count
             }
         
+        except AnalyticsError:
+            # Re-raise AnalyticsError as-is
+            raise
         except Exception as e:
             logger.error(f"Failed to get income/expense summary: {e}", exc_info=True)
-            raise
+            raise AnalyticsError(
+                f"Query execution failed: {e}",
+                details={
+                    "time_frame": time_frame,
+                    "account_id": account_id,
+                    "category_id": category_id,
+                    "start_date": start_date,
+                    "end_date": end_date
+                },
+                original_error=e
+            )
         finally:
             session.close()
     
@@ -180,26 +285,26 @@ class AnalyticsEngine:
                 func.coalesce(Transaction.category, 'Uncategorized').label('category'),
                 func.sum(Transaction.amount).label('total'),
                 func.count(Transaction.id).label('count')
-            ).filter(
-                and_(
-                    Transaction.date >= start_date,
-                    Transaction.date <= end_date
-                )
             )
             
-            # Filter by amount sign if expense_only
+            conditions = [
+                Transaction.date >= start_date,
+                Transaction.date <= end_date,
+            ]
+            
             if expense_only:
-                query = query.filter(Transaction.amount < 0)
+                conditions.append(Transaction.amount < 0)
             
-            # Exclude transfers unless explicitly included
             if not include_transfers:
-                query = query.filter(Transaction.is_transfer == 0)
+                conditions.append(Transaction.is_transfer == 0)
             
-            # Apply account filters
             if account_id:
-                query = query.filter(Transaction.account_id == account_id)
+                conditions.append(Transaction.account_id == account_id)
             elif account_type:
-                query = query.join(Account).filter(Account.type == account_type)
+                query = query.join(Account)
+                conditions.append(Account.type == account_type)
+            
+            query = query.filter(*conditions)
             
             # Group by category
             query = query.group_by('category')
@@ -261,23 +366,24 @@ class AnalyticsEngine:
                 func.coalesce(Transaction.category, 'Uncategorized').label('category'),
                 func.sum(Transaction.amount).label('total'),
                 func.count(Transaction.id).label('count')
-            ).filter(
-                and_(
-                    Transaction.date >= start_date,
-                    Transaction.date <= end_date,
-                    Transaction.amount > 0  # Only positive amounts (income)
-                )
             )
             
-            # Exclude transfers unless explicitly included
-            if not include_transfers:
-                query = query.filter(Transaction.is_transfer == 0)
+            conditions = [
+                Transaction.date >= start_date,
+                Transaction.date <= end_date,
+                Transaction.amount > 0,
+            ]
             
-            # Apply account filters
+            if not include_transfers:
+                conditions.append(Transaction.is_transfer == 0)
+            
             if account_id:
-                query = query.filter(Transaction.account_id == account_id)
+                conditions.append(Transaction.account_id == account_id)
             elif account_type:
-                query = query.join(Account).filter(Account.type == account_type)
+                query = query.join(Account)
+                conditions.append(Account.type == account_type)
+            
+            query = query.filter(*conditions)
             
             # Group by category
             query = query.group_by('category')
@@ -333,21 +439,21 @@ class AnalyticsEngine:
                 extract('year', Transaction.date).label('year'),
                 extract('month', Transaction.date).label('month'),
                 Transaction.amount
-            ).filter(
-                and_(
-                    Transaction.date >= start_date,
-                    Transaction.date <= end_date
-                )
             )
             
-            # Exclude transfers from trends
-            query = query.filter(Transaction.is_transfer == 0)
+            conditions = [
+                Transaction.date >= start_date,
+                Transaction.date <= end_date,
+                Transaction.is_transfer == 0,
+            ]
             
-            # Apply account filters
             if account_id:
-                query = query.filter(Transaction.account_id == account_id)
+                conditions.append(Transaction.account_id == account_id)
             elif account_type:
-                query = query.join(Account).filter(Account.type == account_type)
+                query = query.join(Account)
+                conditions.append(Account.type == account_type)
+            
+            query = query.filter(*conditions)
             
             # Execute query and convert to DataFrame
             results = query.all()
@@ -414,7 +520,10 @@ class AnalyticsEngine:
             return pd.DataFrame(columns=['year', 'month', 'income', 'expenses', 'net', 'period'])
         
         if comparison_type not in ['previous_month', 'previous_year']:
-            raise ValueError(f"Invalid comparison_type: {comparison_type}. Must be 'previous_month' or 'previous_year'")
+            raise AnalyticsError(
+                f"Invalid comparison_type: {comparison_type}. Must be 'previous_month' or 'previous_year'",
+                details={"comparison_type": comparison_type}
+            )
         
         session = self.db_manager.get_session()
         

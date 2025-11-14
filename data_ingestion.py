@@ -15,8 +15,9 @@ from typing import Callable, Dict, Iterator, Optional, Union
 import pandas as pd
 from pandas import errors as pd_errors
 
-# Added: Import custom exception and prompt helper for resilience
-from utils import IngestionError, prompt_user_choice
+# Import custom exception and prompt helper for resilience
+from exceptions import IngestionError
+from utils import prompt_user_choice
 
 # Configure logging
 logger = logging.getLogger(__name__)

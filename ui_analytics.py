@@ -38,6 +38,12 @@ from config_manager import (
     get_app_connection_string
 )
 from ui_import import launch_import_tab
+from exceptions import (
+    FinanceAppError,
+    ConfigError,
+    DatabaseError,
+    UIError
+)
 
 logger = logging.getLogger(__name__)
 
@@ -439,9 +445,25 @@ def main_ui_analytics():
         db_manager = DatabaseManager(connection_string)
         analytics = AnalyticsEngine(db_manager)
         report_gen = ReportGenerator()
+    except DatabaseError as e:
+        # User-friendly error message for UI
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        st.error(f"Database connection failed: {error_msg}")
+        if e.details:
+            with st.expander("Error Details"):
+                for key, value in e.details.items():
+                    st.text(f"{key}: {value}")
+        logger.error(f"Database error: {error_msg}", exc_info=True)
+        st.stop()
+    except (ConfigError, FinanceAppError) as e:
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        st.error(f"Configuration error: {error_msg}")
+        logger.error(f"Config error: {error_msg}", exc_info=True)
+        st.stop()
     except Exception as e:
-        st.error(f"Failed to connect to database: {e}")
-        return
+        st.error("An unexpected error occurred while connecting to the database.")
+        logger.exception(f"Unexpected error connecting to database: {e}")
+        st.stop()
     
     # Sidebar filters
     st.sidebar.header("Filters")
@@ -551,9 +573,20 @@ def main_ui_analytics():
         elif report_type == "Import Data":
             launch_import_tab()
     
+    except (DatabaseError, FinanceAppError) as e:
+        # Normalize error messages for UI
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        st.error(f"Error generating report: {error_msg}")
+        logger.error(f"UI error: {error_msg}", exc_info=True)
+        if e.details:
+            with st.expander("Error Details"):
+                for key, value in e.details.items():
+                    st.text(f"{key}: {value}")
     except Exception as e:
-        st.error(f"Error generating report: {e}")
-        logger.error(f"UI error: {e}", exc_info=True)
+        # Unexpected error - show user-friendly message, log full details
+        st.error("An unexpected error occurred while generating the report.")
+        logger.exception(f"Unexpected UI error: {e}")
+        st.info("💡 Please check the logs for more details or try refreshing the page.")
     
     finally:
         db_manager.close()
@@ -1816,10 +1849,15 @@ def render_budget_tab(db_manager):
     
     try:
         render_budget_dashboard(db_manager)
-    except Exception as e:
-        st.error(f"Error loading budget dashboard: {e}")
-        logger.error(f"Budget UI error: {e}", exc_info=True)
+    except (DatabaseError, FinanceAppError) as e:
+        error_msg = e.message if hasattr(e, 'message') else str(e)
+        st.error(f"Error loading budget dashboard: {error_msg}")
+        logger.error(f"Budget UI error: {error_msg}", exc_info=True)
         st.info("💡 Tip: Make sure you have imported transactions with categories!")
+    except Exception as e:
+        st.error("An unexpected error occurred while loading the budget dashboard.")
+        logger.exception(f"Unexpected budget UI error: {e}")
+        st.info("💡 Please check the logs for more details or try refreshing the page.")
 
 
 if __name__ == "__main__":

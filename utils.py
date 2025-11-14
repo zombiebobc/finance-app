@@ -22,14 +22,8 @@ _DEFAULT_DATA_DIR_NAME = "data"
 _DEFAULT_DB_FILENAME = "transactions.db"
 
 
-# Added: Custom exceptions for ingestion and standardization workflows
-class IngestionError(ValueError):
-    """Raised when CSV ingestion encounters a non-recoverable error."""
-
-
-# Added: Custom exceptions for ingestion and standardization workflows
-class StandardizationError(ValueError):
-    """Raised when data standardization cannot continue safely."""
+# Import exceptions from centralized module
+from exceptions import IngestionError, StandardizationError
 
 
 # Added: Prompt utility to support interactive CLI fallbacks

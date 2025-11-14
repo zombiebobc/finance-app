@@ -6,6 +6,9 @@ pandas>=2.0.0
 # Database ORM
 SQLAlchemy>=2.0.0
 
+# Encryption
+cryptography>=42.0.0
+
 # Configuration
 PyYAML>=6.0
 

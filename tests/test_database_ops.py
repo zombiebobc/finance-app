@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Dict
 
 import pytest
@@ -60,7 +60,7 @@ def test_insert_transaction_sqlite_handles_special_characters(sqlite_conn):
 
 
 def test_insert_transaction_sqlite_missing_fields_raises(sqlite_conn):
-    payload = {"date": datetime.utcnow().isoformat()}
+    payload = {"date": datetime.now(UTC).isoformat()}
     with pytest.raises(DatabaseError):
         insert_transaction_sqlite(sqlite_conn, payload)
 
@@ -126,4 +126,85 @@ def test_injection_attempt_treated_as_literal(sqlite_conn):
     assert len(results) == 1
     assert results[0]["description"] == payload["description"]
 
+
+def test_insert_transaction_sqlite_missing_fields_raises_database_error(sqlite_conn):
+    """Test that missing required fields raises DatabaseError with details."""
+    payload = {"date": datetime.now(UTC).isoformat()}
+    with pytest.raises(DatabaseError) as exc_info:
+        insert_transaction_sqlite(sqlite_conn, payload)
+    
+    error = exc_info.value
+    assert "Missing required transaction fields" in error.message
+    assert "missing_fields" in error.details
+    assert "required_fields" in error.details
+
+
+def test_insert_transaction_sqlite_integrity_error_raises_database_error(sqlite_conn):
+    """Test that integrity errors raise DatabaseError with details."""
+    # Insert first transaction
+    payload1 = _build_transaction(1, duplicate_hash="test-hash-123")
+    insert_transaction_sqlite(sqlite_conn, payload1)
+    
+    # Try to insert duplicate (same duplicate_hash should be unique)
+    payload2 = _build_transaction(2, duplicate_hash="test-hash-123")
+    with pytest.raises(DatabaseError) as exc_info:
+        insert_transaction_sqlite(sqlite_conn, payload2)
+    
+    error = exc_info.value
+    assert "constraints" in error.message.lower()
+    assert error.original_error is not None
+
+
+def test_database_error_details_preserved(sqlite_conn):
+    """Test that DatabaseError preserves error details and original error."""
+    payload = {"date": datetime.now(UTC).isoformat()}
+    
+    try:
+        insert_transaction_sqlite(sqlite_conn, payload)
+    except DatabaseError as e:
+        assert e.message is not None
+        assert isinstance(e.details, dict)
+        assert "missing_fields" in e.details
+        assert isinstance(e.details["missing_fields"], list)
+
+
+def test_query_transactions_sqlite_database_error_on_failure(sqlite_conn):
+    """Test that query failures raise DatabaseError."""
+    # Close connection to cause error
+    sqlite_conn.close()
+    
+    with pytest.raises(DatabaseError):
+        query_transactions_sqlite(sqlite_conn, {})
+
+
+def test_delete_transaction_sqlite_database_error_on_failure(sqlite_conn):
+    """Test that delete failures raise DatabaseError with transaction_id in details."""
+    # Insert a transaction first
+    row_id = insert_transaction_sqlite(sqlite_conn, _build_transaction(100))
+    
+    # Close connection to cause error
+    sqlite_conn.close()
+    
+    with pytest.raises(DatabaseError) as exc_info:
+        delete_transaction_sqlite(sqlite_conn, row_id)
+    
+    error = exc_info.value
+    assert "Failed to delete transaction" in error.message
+    # Note: transaction_id may not be in details if connection is already closed
+    assert error.original_error is not None
+
+
+def test_bulk_insert_database_error_on_failure(sqlite_conn):
+    """Test that bulk insert failures raise DatabaseError with operation details."""
+    # Create transactions with invalid data (missing required fields)
+    invalid_transactions = [
+        {"date": datetime.now(UTC).isoformat()}  # Missing required fields
+    ]
+    
+    with pytest.raises(DatabaseError) as exc_info:
+        bulk_insert_transactions_sqlite(sqlite_conn, invalid_transactions)
+    
+    error = exc_info.value
+    assert error.message is not None
+    assert "operation" in error.details or "error" in error.details
 

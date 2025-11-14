@@ -10,9 +10,11 @@ This module orchestrates the import process:
 
 import argparse
 import logging
+import logging.handlers
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 import yaml
 
 from data_ingestion import CSVReader
@@ -20,6 +22,14 @@ from data_standardization import DataStandardizer
 from duplicate_detection import DuplicateDetector
 from database_ops import DatabaseManager
 from utils import ensure_data_dir, resolve_connection_string, resolve_log_path
+from exceptions import (
+    FinanceAppError,
+    ConfigError,
+    DatabaseError,
+    IngestionError,
+    StandardizationError,
+    UIError
+)
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
@@ -29,27 +39,124 @@ def setup_logging(config: dict) -> None:
     """
     Configure logging based on config settings.
     
+    Ensures file logging is enabled by default if a log_file is specified in config.
+    Handles edge cases like missing config keys, invalid log levels/formats, and
+    file write permissions issues. Logging failures will not crash the app.
+    
     Args:
         config: Configuration dictionary with logging settings
+        
+    Raises:
+        ConfigError: If log level or format is invalid
+        FinanceAppError: If log file path cannot be prepared (non-fatal, logs warning)
     """
     log_config = config.get("logging", {})
-    log_level = getattr(logging, log_config.get("level", "INFO").upper())
-    log_format = log_config.get("format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    log_file = log_config.get("file")
+    
+    # Validate and set log level with fallback
+    log_level_str = log_config.get("level", "INFO").upper()
+    try:
+        log_level = getattr(logging, log_level_str)
+        if not isinstance(log_level, int):
+            raise AttributeError(f"Invalid log level: {log_level_str}")
+    except AttributeError:
+        logger.warning(f"Invalid log level '{log_level_str}', defaulting to INFO")
+        log_level = logging.INFO
+        log_level_str = "INFO"
+    
+    # Validate and set log format with fallback
+    log_format = log_config.get(
+        "format",
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
+    # Ensure log format includes timestamp
+    if "%(asctime)s" not in log_format:
+        logger.debug("Log format missing timestamp, adding default format")
+        log_format = "%(asctime)s - " + log_format
     
     handlers = [logging.StreamHandler(sys.stdout)]
+    
+    # File logging: enable by default if log_file is specified
+    log_file = log_config.get("file")
     if log_file:
         try:
             log_path = resolve_log_path(log_file)
-        except OSError as exc:
-            raise RuntimeError(f"Unable to prepare log file path '{log_file}': {exc}") from exc
-        handlers.append(logging.FileHandler(log_path))
+            
+            # Ensure parent directory exists
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Try to create file handler with error handling
+            try:
+                file_handler = logging.FileHandler(log_path, encoding='utf-8')
+                handlers.append(file_handler)
+                logger.info(f"File logging enabled: {log_path}")
+            except (OSError, PermissionError) as exc:
+                # Non-fatal: log warning but continue without file logging
+                logger.warning(
+                    f"Unable to create log file '{log_path}': {exc}. "
+                    f"Continuing without file logging."
+                )
+        except (OSError, ValueError) as exc:
+            # Non-fatal: log warning but continue without file logging
+            logger.warning(
+                f"Unable to prepare log file path '{log_file}': {exc}. "
+                f"Continuing without file logging."
+            )
     
-    logging.basicConfig(
-        level=log_level,
-        format=log_format,
-        handlers=handlers
-    )
+    # Email alerts: optional integration for critical errors
+    email_config = config.get("email_alerts", {})
+    if email_config.get("enabled", False):
+        try:
+            smtp_host = email_config.get("smtp_host")
+            smtp_port = email_config.get("smtp_port", 587)
+            from_address = email_config.get("from_address")
+            to_addresses = email_config.get("to_addresses", [])
+            email_level = getattr(logging, email_config.get("level", "CRITICAL").upper(), logging.CRITICAL)
+            subject = email_config.get("subject", "Finance App Critical Error")
+            
+            if not smtp_host or not from_address or not to_addresses:
+                logger.warning("Email alerts enabled but missing required config (smtp_host, from_address, to_addresses). Skipping email handler.")
+            else:
+                try:
+                    # Create SMTP handler for critical errors
+                    smtp_handler = logging.handlers.SMTPHandler(
+                        mailhost=(smtp_host, smtp_port),
+                        fromaddr=from_address,
+                        toaddrs=to_addresses,
+                        subject=subject,
+                        credentials=(email_config.get("username"), email_config.get("password")) if email_config.get("username") else None,
+                        secure=() if email_config.get("use_tls", True) else None
+                    )
+                    smtp_handler.setLevel(email_level)
+                    handlers.append(smtp_handler)
+                    logger.info(f"Email alerts enabled: level={logging.getLevelName(email_level)}, to={to_addresses}")
+                except Exception as exc:
+                    # Non-fatal: log warning but continue without email alerts
+                    logger.warning(
+                        f"Unable to setup email alerts: {exc}. "
+                        f"Continuing without email alerting."
+                    )
+        except Exception as exc:
+            # Non-fatal: log warning but continue without email alerts
+            logger.warning(
+                f"Error configuring email alerts: {exc}. "
+                f"Continuing without email alerting."
+            )
+    
+    # Configure logging
+    try:
+        logging.basicConfig(
+            level=log_level,
+            format=log_format,
+            handlers=handlers,
+            force=True  # Override any existing configuration
+        )
+        email_status = "enabled" if email_config.get("enabled", False) else "disabled"
+        logger.info(f"Logging configured: level={log_level_str}, file={'enabled' if log_file else 'disabled'}, email={email_status}")
+    except Exception as exc:
+        # This should never happen, but if it does, use defaults
+        logger.error(f"Failed to configure logging: {exc}. Using basic defaults.")
+        logging.basicConfig(level=logging.INFO, format=log_format)
 
 
 def load_config(config_path: Path) -> dict:
@@ -63,14 +170,41 @@ def load_config(config_path: Path) -> dict:
         Configuration dictionary
     
     Raises:
-        FileNotFoundError: If config file doesn't exist
-        yaml.YAMLError: If config file is invalid YAML
+        ConfigError: If config file cannot be loaded or is invalid
     """
     if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+        raise ConfigError(
+            f"Config file not found: {config_path}",
+            details={"config_path": str(config_path)}
+        )
     
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        raise ConfigError(
+            f"Invalid YAML in config file: {config_path}",
+            details={"config_path": str(config_path), "yaml_error": str(exc)},
+            original_error=exc
+        ) from exc
+    except (OSError, PermissionError) as exc:
+        raise ConfigError(
+            f"Unable to read config file: {config_path}",
+            details={"config_path": str(config_path)},
+            original_error=exc
+        ) from exc
+    
+    if config is None:
+        raise ConfigError(
+            f"Config file is empty: {config_path}",
+            details={"config_path": str(config_path)}
+        )
+    
+    if not isinstance(config, dict):
+        raise ConfigError(
+            f"Config file must contain a dictionary, got {type(config).__name__}",
+            details={"config_path": str(config_path), "config_type": type(config).__name__}
+        )
     
     return config
 
@@ -84,8 +218,25 @@ def create_connection_string(config: dict) -> str:
     
     Returns:
         SQLAlchemy connection string
+    
+    Raises:
+        ConfigError: If connection string cannot be created
+        DatabaseError: If database configuration is invalid
     """
-    return resolve_connection_string(config)
+    try:
+        return resolve_connection_string(config)
+    except (ValueError, KeyError) as exc:
+        raise ConfigError(
+            "Invalid database configuration",
+            details={"error": str(exc)},
+            original_error=exc
+        ) from exc
+    except Exception as exc:
+        raise DatabaseError(
+            "Failed to create database connection string",
+            details={"error": str(exc)},
+            original_error=exc
+        ) from exc
 
 
 def import_transactions(
@@ -277,8 +428,17 @@ def import_transactions(
                 f"{file_stats['skipped']} skipped"
             )
             
-        except Exception as e:
+        except (IngestionError, StandardizationError) as e:
             logger.error(f"Error processing file {file_path}: {e}", exc_info=True)
+            stats["files_failed"] += 1
+            stats["errors"].append(f"{file_path}: {str(e)}")
+        except FinanceAppError as e:
+            logger.error(f"Finance app error processing file {file_path}: {e}", exc_info=True)
+            stats["files_failed"] += 1
+            stats["errors"].append(f"{file_path}: {str(e)}")
+        except Exception as e:
+            # Catch-all for unexpected errors
+            logger.error(f"Unexpected error processing file {file_path}: {e}", exc_info=True)
             stats["files_failed"] += 1
             stats["errors"].append(f"{file_path}: {str(e)}")
     
@@ -595,6 +755,28 @@ def main():
         help="Show transfer statistics after reclassification"
     )
     
+    # Backup command
+    backup_parser = subparsers.add_parser(
+        "backup",
+        help="Create a timestamped backup of the database"
+    )
+    
+    # Restore command
+    restore_parser = subparsers.add_parser(
+        "restore",
+        help="Restore the database from a backup"
+    )
+    restore_parser.add_argument(
+        "--backup-file",
+        type=str,
+        help="Path to specific backup file to restore (if not provided, will list available backups)"
+    )
+    restore_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip confirmation prompt (use with caution)"
+    )
+    
     args = parser.parse_args()
     
     # Handle case where no command is provided
@@ -602,51 +784,105 @@ def main():
         parser.print_help()
         sys.exit(1)
     
-    # Load configuration
+    # Load configuration with error handling
     config_path = Path(args.config)
     try:
         config = load_config(config_path)
+    except ConfigError as e:
+        # User-friendly error message for CLI
+        print(f"Configuration error: {e.message}", file=sys.stderr)
+        if e.details:
+            for key, value in e.details.items():
+                print(f"  {key}: {value}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"Error loading config: {e}", file=sys.stderr)
+        # Unexpected error
+        print(f"Unexpected error loading config: {e}", file=sys.stderr)
         sys.exit(1)
     
     # Ensure data directory exists before logging/database work
     try:
         ensure_data_dir(config)
-    except Exception as exc:
+    except OSError as exc:
         print(f"Failed to prepare data directory: {exc}", file=sys.stderr)
         sys.exit(1)
+    except Exception as exc:
+        print(f"Unexpected error preparing data directory: {exc}", file=sys.stderr)
+        sys.exit(1)
     
-    # Setup logging
-    setup_logging(config)
-    logger = logging.getLogger(__name__)
+    # Setup logging - non-fatal if it fails
+    try:
+        setup_logging(config)
+    except ConfigError as e:
+        # Use basic logging if config-based logging fails
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Logging configuration error: {e.message}. Using basic logging.")
+    except Exception as e:
+        # Use basic logging if setup fails
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Failed to setup logging: {e}. Using basic logging.")
+    else:
+        logger = logging.getLogger(__name__)
     
     # Get database connection string
     try:
         connection_string = create_connection_string(config)
+    except (ConfigError, DatabaseError) as e:
+        logger.error(f"Failed to create connection string: {e.message}")
+        if e.details:
+            for key, value in e.details.items():
+                logger.error(f"  {key}: {value}")
+        print(f"Database configuration error: {e.message}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Failed to create connection string: {e}")
+        logger.error(f"Unexpected error creating connection string: {e}", exc_info=True)
+        print(f"Unexpected database error: {e}", file=sys.stderr)
         sys.exit(1)
     
-    # Route to appropriate command handler
-    if args.command in ["import", "imp"]:
-        handle_import_command(args, config, connection_string)
-    elif args.command == "view":
-        handle_view_command(args, connection_string)
-    elif args.command in ["account", "acc"]:
-        handle_account_command(args, connection_string)
-    elif args.command in ["budget", "bud"]:
-        handle_budget_command(args, connection_string)
-    elif args.command in ["analyze", "report", "stats"]:
-        handle_analyze_command(args, connection_string)
-    elif args.command in ["update-balance", "balance"]:
-        handle_update_balance_command(args, connection_string)
-    elif args.command in ["balance-override", "override"]:
-        handle_balance_override_command(args, connection_string)
-    elif args.command in ["reclassify-transfers", "reclassify", "detect-transfers"]:
-        handle_reclassify_transfers_command(args, connection_string)
-    else:
-        parser.print_help()
+    # Route to appropriate command handler with top-level error handling
+    try:
+        if args.command in ["import", "imp"]:
+            handle_import_command(args, config, connection_string)
+        elif args.command == "view":
+            handle_view_command(args, connection_string)
+        elif args.command in ["account", "acc"]:
+            handle_account_command(args, connection_string)
+        elif args.command in ["budget", "bud"]:
+            handle_budget_command(args, connection_string)
+        elif args.command in ["analyze", "report", "stats"]:
+            handle_analyze_command(args, connection_string)
+        elif args.command in ["update-balance", "balance"]:
+            handle_update_balance_command(args, connection_string)
+        elif args.command in ["balance-override", "override"]:
+            handle_balance_override_command(args, connection_string)
+        elif args.command in ["reclassify-transfers", "reclassify", "detect-transfers"]:
+            handle_reclassify_transfers_command(args, connection_string)
+        elif args.command == "backup":
+            handle_backup_command(args, config, connection_string)
+        elif args.command == "restore":
+            handle_restore_command(args, config, connection_string)
+        else:
+            parser.print_help()
+            sys.exit(1)
+    except FinanceAppError as e:
+        # Handle known finance app errors with normalized messages
+        logger.error(f"Application error: {e.message}", exc_info=True)
+        if e.details:
+            for key, value in e.details.items():
+                logger.error(f"  {key}: {value}")
+        print(f"Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("Command interrupted by user")
+        print("\nCommand interrupted by user.", file=sys.stderr)
+        sys.exit(130)  # Standard exit code for SIGINT
+    except Exception as e:
+        # Unexpected error - log full details, show user-friendly message
+        logger.exception(f"Unexpected error: {e}")
+        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        print("Check the logs for details.", file=sys.stderr)
         sys.exit(1)
 
 
@@ -670,8 +906,16 @@ def handle_import_command(args: argparse.Namespace, config: dict, connection_str
     try:
         db_manager = DatabaseManager(connection_string)
         db_manager.create_tables()
+    except DatabaseError as e:
+        logger.error(f"Failed to initialize database: {e.message}")
+        if e.details:
+            for key, value in e.details.items():
+                logger.error(f"  {key}: {value}")
+        print(f"Database error: {e.message}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
+        logger.error(f"Unexpected error initializing database: {e}", exc_info=True)
+        print(f"Failed to initialize database: {e}", file=sys.stderr)
         sys.exit(1)
     
     # Import transactions (with account linking if enhanced import available)
@@ -738,8 +982,16 @@ def handle_import_command(args: argparse.Namespace, config: dict, connection_str
                     else:
                         total_stats["files_failed"] += 1
                         total_stats["errors"].append(result.get("error", "Unknown error"))
+                except (IngestionError, StandardizationError, DatabaseError) as e:
+                    logger.error(f"Error importing {file_path}: {e.message if hasattr(e, 'message') else str(e)}", exc_info=True)
+                    total_stats["files_failed"] += 1
+                    total_stats["errors"].append(f"{file_path}: {e.message if hasattr(e, 'message') else str(e)}")
+                except FinanceAppError as e:
+                    logger.error(f"Finance app error importing {file_path}: {e.message}", exc_info=True)
+                    total_stats["files_failed"] += 1
+                    total_stats["errors"].append(f"{file_path}: {e.message}")
                 except Exception as e:
-                    logger.error(f"Error importing {file_path}: {e}", exc_info=True)
+                    logger.error(f"Unexpected error importing {file_path}: {e}", exc_info=True)
                     total_stats["files_failed"] += 1
                     total_stats["errors"].append(f"{file_path}: {str(e)}")
             
@@ -776,8 +1028,17 @@ def handle_import_command(args: argparse.Namespace, config: dict, connection_str
         print(f"Total transactions in database: {total_in_db}")
         print("="*60 + "\n")
         
+    except (IngestionError, StandardizationError, DatabaseError) as e:
+        logger.error(f"Import failed: {e.message if hasattr(e, 'message') else str(e)}", exc_info=True)
+        print(f"Import error: {e.message if hasattr(e, 'message') else str(e)}", file=sys.stderr)
+        sys.exit(1)
+    except FinanceAppError as e:
+        logger.error(f"Import failed: {e.message}", exc_info=True)
+        print(f"Import error: {e.message}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Import failed: {e}", exc_info=True)
+        logger.error(f"Unexpected error during import: {e}", exc_info=True)
+        print(f"Import failed: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
         db_manager.close()
@@ -818,7 +1079,14 @@ def handle_view_command(args: argparse.Namespace, connection_string: str) -> Non
             ])
         except KeyboardInterrupt:
             pass
+        except (UIError, ImportError) as e:
+            error_msg = e.message if hasattr(e, 'message') else str(e)
+            logger.error(f"Failed to launch Streamlit UI: {error_msg}")
+            print(f"Error launching Streamlit UI: {error_msg}", file=sys.stderr)
+            print("Make sure Streamlit is installed: pip install streamlit", file=sys.stderr)
+            sys.exit(1)
         except Exception as e:
+            logger.error(f"Unexpected error launching Streamlit UI: {e}", exc_info=True)
             print(f"Error launching Streamlit UI: {e}", file=sys.stderr)
             sys.exit(1)
     else:
@@ -1258,6 +1526,116 @@ def handle_balance_override_command(args: argparse.Namespace, connection_string:
         sys.exit(1)
     finally:
         db_manager.close()
+
+
+def handle_backup_command(args: argparse.Namespace, config: dict, connection_string: str) -> None:
+    """
+    Handle the backup command.
+    
+    Args:
+        args: Parsed command-line arguments
+        config: Configuration dictionary
+        connection_string: Database connection string
+    """
+    try:
+        from utils.backup import create_backup, BackupError
+        
+        backup_path = create_backup(connection_string, config)
+        print(f"✓ Backup created successfully: {backup_path}")
+        
+    except BackupError as e:
+        logger.error(f"Backup failed: {e.message}", exc_info=True)
+        if e.details:
+            for key, value in e.details.items():
+                logger.error(f"  {key}: {value}")
+        print(f"Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error during backup: {e}", exc_info=True)
+        print(f"Backup failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def handle_restore_command(args: argparse.Namespace, config: dict, connection_string: str) -> None:
+    """
+    Handle the restore command.
+    
+    Args:
+        args: Parsed command-line arguments
+        config: Configuration dictionary
+        connection_string: Database connection string
+    """
+    try:
+        from utils.backup import (
+            list_backups,
+            restore_backup,
+            BackupError
+        )
+        
+        if args.backup_file:
+            # Restore from specified file
+            restore_backup(args.backup_file, connection_string, force=args.force)
+            print(f"✓ Database restored successfully from: {args.backup_file}")
+        else:
+            # Interactive: list backups and prompt for selection
+            backups = list_backups(db_path=connection_string, config=config)
+            
+            if not backups:
+                print("No backups found.", file=sys.stderr)
+                print("Create a backup first using: python main.py backup", file=sys.stderr)
+                sys.exit(1)
+            
+            # Display available backups
+            print("\nAvailable backups:")
+            print("=" * 80)
+            for i, backup in enumerate(backups, 1):
+                backup_path = Path(backup)
+                mtime = datetime.fromtimestamp(backup_path.stat().st_mtime)
+                size_mb = backup_path.stat().st_size / (1024 * 1024)
+                print(f"{i}. {backup_path.name}")
+                print(f"   Created: {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"   Size: {size_mb:.2f} MB")
+                print()
+            
+            # Prompt for selection
+            while True:
+                try:
+                    choice = input(f"Select backup to restore (1-{len(backups)}) or 'q' to quit: ").strip()
+                    if choice.lower() == 'q':
+                        print("Restore cancelled.")
+                        return
+                    
+                    index = int(choice) - 1
+                    if 0 <= index < len(backups):
+                        selected_backup = backups[index]
+                        break
+                    else:
+                        print(f"Invalid choice. Please enter a number between 1 and {len(backups)}.")
+                except ValueError:
+                    print("Invalid input. Please enter a number or 'q' to quit.")
+                except KeyboardInterrupt:
+                    print("\nRestore cancelled.")
+                    return
+            
+            # Restore selected backup
+            restore_backup(selected_backup, connection_string, force=args.force)
+            print(f"✓ Database restored successfully from: {selected_backup}")
+        
+    except BackupError as e:
+        logger.error(f"Restore failed: {e.message}", exc_info=True)
+        if e.details:
+            for key, value in e.details.items():
+                logger.error(f"  {key}: {value}")
+        print(f"Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("Restore interrupted by user")
+        print("\nRestore cancelled.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Unexpected error during restore: {e}", exc_info=True)
+        print(f"Restore failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def handle_reclassify_transfers_command(args: argparse.Namespace, connection_string: str) -> None:

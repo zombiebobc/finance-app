@@ -7,25 +7,110 @@ using SQLAlchemy ORM. Supports SQLite by default with easy migration to other da
 
 import logging
 import sqlite3
-from datetime import datetime
-from typing import List, Optional, Dict, Any, Iterable, Tuple
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Date, Index, ForeignKey, Enum
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy import (
+    Column,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    create_engine,
+    text,
+)
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, relationship, sessionmaker, validates, declarative_base
 import enum
+
+from encryption_utils import (
+    DecryptionError,
+    EncryptedNumeric,
+    EncryptedString,
+    attach_sqlalchemy_listeners,
+    derive_search_token,
+    encrypt_transaction_payload,
+    get_encryption_manager,
+    is_ciphertext,
+    register_sqlite_functions,
+)
+from exceptions import DatabaseError
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 
-class DatabaseError(Exception):
-    """Custom exception type for sqlite3 database operations."""
+def utc_now() -> datetime:
+    """
+    Get current UTC datetime with timezone awareness.
+    
+    Replaces deprecated datetime.utcnow() with timezone-aware alternative.
+    All timestamps in the database are stored in UTC.
+    
+    Returns:
+        Current datetime in UTC with timezone info
+    """
+    return datetime.now(UTC)
 
 
-# Base class for declarative models
+def _ensure_account_security_columns(engine) -> None:
+    """
+    Ensure supporting columns (like account name index) exist and are populated.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+
+    try:
+        with engine.begin() as connection:
+            table_exists = connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'")
+            ).fetchone()
+            if not table_exists:
+                return
+            column_rows = connection.execute(text("PRAGMA table_info(accounts)")).fetchall()
+            column_names = {row[1] for row in column_rows}
+            if "name_index" not in column_names:
+                connection.execute(text("ALTER TABLE accounts ADD COLUMN name_index TEXT"))
+            connection.execute(
+                text("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_name_index ON accounts(name_index)")
+            )
+
+            manager = get_encryption_manager()
+            rows = connection.execute(
+                text("SELECT id, name, name_index FROM accounts")
+            ).fetchall()
+            for row in rows:
+                row_id = row[0]
+                stored_name = row[1]
+                existing_index = row[2]
+                if existing_index:
+                    continue
+                if not stored_name:
+                    continue
+                if is_ciphertext(stored_name):
+                    try:
+                        plaintext = manager.decrypt_value(stored_name, str)
+                    except DecryptionError:
+                        plaintext = None
+                else:
+                    plaintext = stored_name
+                if not plaintext:
+                    continue
+                token = derive_search_token(plaintext)
+                connection.execute(
+                    text("UPDATE accounts SET name_index = :token WHERE id = :id"),
+                    {"token": token, "id": row_id},
+                )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Failed to ensure account security columns: %s", exc)
+        raise
+
+
+# Base class for declarative models (using SQLAlchemy 2.0+ pattern)
 Base = declarative_base()
 
 
@@ -55,11 +140,12 @@ class Account(Base):
     __tablename__ = "accounts"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(100), nullable=False, unique=True)
+    name = Column(EncryptedString(256), nullable=False)
+    name_index = Column(String(96), nullable=False, unique=True, index=True)
     type = Column(Enum(AccountType), nullable=False, index=True)
-    balance = Column(Float, default=0.0, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    balance = Column(EncryptedNumeric(), default=0.0, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
     
     # Relationship to transactions
     transactions = relationship("Transaction", foreign_keys="[Transaction.account_id]", back_populates="account_ref")
@@ -67,6 +153,15 @@ class Account(Base):
     def __repr__(self) -> str:
         """String representation of the account."""
         return f"<Account(id={self.id}, name='{self.name}', type={self.type.value}, balance={self.balance})>"
+
+    @validates("name")
+    def _update_name_index(self, key: str, value: str) -> str:
+        """Update deterministic search token whenever the plaintext name changes."""
+        token = derive_search_token(value)
+        if not token:
+            raise ValueError("Account name cannot be empty.")
+        self.name_index = token
+        return value
 
 
 class Budget(Base):
@@ -86,12 +181,12 @@ class Budget(Base):
     __tablename__ = "budgets"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    category = Column(String(100), nullable=False, index=True)
-    allocated_amount = Column(Float, nullable=False, default=0.0)
-    period_start = Column(DateTime, nullable=False)
-    period_end = Column(DateTime, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    category = Column(EncryptedString(100), nullable=False, index=True)
+    allocated_amount = Column(EncryptedNumeric(), nullable=False, default=0.0)
+    period_start = Column(DateTime(timezone=True), nullable=False)
+    period_end = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
     
     def __repr__(self) -> str:
         """String representation of the budget."""
@@ -109,10 +204,10 @@ class IncomeOverride(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     period_start = Column(Date, nullable=False, unique=True, index=True)
     period_end = Column(Date, nullable=False)
-    override_amount = Column(Float, nullable=False)
+    override_amount = Column(EncryptedNumeric(), nullable=False)
     notes = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
     
     def __repr__(self) -> str:
         return (
@@ -139,8 +234,8 @@ class BalanceHistory(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False, index=True)
-    balance = Column(Float, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    balance = Column(EncryptedNumeric(), nullable=False)
+    timestamp = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
     notes = Column(String(255), nullable=True)
     
     # Relationship to account
@@ -176,8 +271,8 @@ class BalanceOverride(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False, index=True)
     override_date = Column(Date, nullable=False, index=True)
-    override_balance = Column(Float, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    override_balance = Column(EncryptedNumeric(), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     notes = Column(String(255), nullable=True)
     
     # Relationship to account
@@ -217,14 +312,14 @@ class Transaction(Base):
     __tablename__ = "transactions"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    date = Column(DateTime, nullable=False, index=True)
-    description = Column(String(500), nullable=False)
-    amount = Column(Float, nullable=False)
-    category = Column(String(100), nullable=True)
-    account = Column(String(100), nullable=True)  # Legacy field for backward compatibility
+    date = Column(DateTime(timezone=True), nullable=False, index=True)
+    description = Column(EncryptedString(500), nullable=False)
+    amount = Column(EncryptedNumeric(), nullable=False)
+    category = Column(EncryptedString(100), nullable=True)
+    account = Column(EncryptedString(100), nullable=True)  # Legacy field for backward compatibility
     account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True, index=True)
-    source_file = Column(String(255), nullable=False)
-    import_timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    source_file = Column(EncryptedString(255), nullable=False)
+    import_timestamp = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     duplicate_hash = Column(String(32), nullable=False, unique=True, index=True)
     is_transfer = Column(Integer, default=0, nullable=False)  # 0 = no, 1 = yes
     transfer_to_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
@@ -237,6 +332,7 @@ class Transaction(Base):
     __table_args__ = (
         Index('idx_date_amount', 'date', 'amount'),
         Index('idx_account_date', 'account_id', 'date'),
+        Index('idx_category_date', 'category', 'date'),  # For category filtering with date ranges
     )
     
     def __repr__(self) -> str:
@@ -267,7 +363,9 @@ class DatabaseManager:
         """
         try:
             self.engine = create_engine(connection_string, echo=False)
+            attach_sqlalchemy_listeners(self.engine)
             self.SessionLocal = sessionmaker(bind=self.engine)
+            _ensure_account_security_columns(self.engine)
             logger.info(f"Database manager initialized with connection: {connection_string}")
         except SQLAlchemyError as e:
             logger.error(f"Failed to initialize database: {e}")
@@ -379,7 +477,7 @@ class DatabaseManager:
                         account=trans_dict.get("account"),
                         account_id=trans_dict.get("account_id"),
                         source_file=trans_dict["source_file"],
-                        import_timestamp=datetime.utcnow(),
+                        import_timestamp=utc_now(),
                         duplicate_hash=trans_dict["duplicate_hash"],
                         is_transfer=trans_dict.get("is_transfer", 0),
                         transfer_to_account_id=trans_dict.get("transfer_to_account_id")
@@ -695,6 +793,7 @@ class DatabaseManager:
 def _configure_sqlite_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
     """Configure sqlite connection defaults."""
     conn.row_factory = sqlite3.Row
+    register_sqlite_functions(conn)
     return conn
 
 
@@ -750,9 +849,10 @@ def init_sqlite_db(conn: sqlite3.Connection) -> None:
             """
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                name_index TEXT NOT NULL UNIQUE,
                 type TEXT NOT NULL,
-                balance REAL NOT NULL DEFAULT 0.0,
+                balance TEXT NOT NULL DEFAULT '0.0',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -765,7 +865,7 @@ def init_sqlite_db(conn: sqlite3.Connection) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT NOT NULL,
                 description TEXT NOT NULL,
-                amount REAL NOT NULL,
+                amount TEXT NOT NULL,
                 category TEXT,
                 account TEXT,
                 account_id INTEGER,
@@ -785,7 +885,7 @@ def init_sqlite_db(conn: sqlite3.Connection) -> None:
             CREATE TABLE IF NOT EXISTS budgets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 category TEXT NOT NULL,
-                allocated_amount REAL NOT NULL DEFAULT 0.0,
+                allocated_amount TEXT NOT NULL DEFAULT '0.0',
                 period_start TEXT NOT NULL,
                 period_end TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -800,7 +900,7 @@ def init_sqlite_db(conn: sqlite3.Connection) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 period_start TEXT NOT NULL UNIQUE,
                 period_end TEXT NOT NULL,
-                override_amount REAL NOT NULL,
+                override_amount TEXT NOT NULL,
                 notes TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -814,12 +914,16 @@ def init_sqlite_db(conn: sqlite3.Connection) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_id INTEGER NOT NULL,
                 override_date TEXT NOT NULL,
-                override_balance REAL NOT NULL,
+                override_balance TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 notes TEXT,
                 FOREIGN KEY(account_id) REFERENCES accounts(id)
             )
             """,
+            (),
+        ),
+        (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_name_index ON accounts(name_index)",
             (),
         ),
         (
@@ -846,7 +950,11 @@ def init_sqlite_db(conn: sqlite3.Connection) -> None:
         logger.info("SQLite schema initialized successfully.")
     except sqlite3.Error as exc:
         logger.exception("Failed to initialize SQLite schema.")
-        raise DatabaseError("Failed to initialize database schema.") from exc
+        raise DatabaseError(
+            "Failed to initialize database schema",
+            details={"operation": "initialize_schema", "error": str(exc)},
+            original_error=exc
+        ) from exc
 
 
 def insert_transaction_sqlite(conn: sqlite3.Connection, transaction_data: Dict[str, Any]) -> int:
@@ -854,9 +962,13 @@ def insert_transaction_sqlite(conn: sqlite3.Connection, transaction_data: Dict[s
     required_fields = ("date", "description", "amount", "source_file", "duplicate_hash")
     missing = [field for field in required_fields if field not in transaction_data]
     if missing:
-        raise DatabaseError(f"Missing required transaction fields: {', '.join(missing)}")
+        raise DatabaseError(
+            "Missing required transaction fields",
+            details={"missing_fields": missing, "required_fields": list(required_fields)}
+        )
 
     try:
+        payload = encrypt_transaction_payload(transaction_data)
         with conn:
             cursor = conn.execute(
                 # Fixed: Parameterized query prevents SQL injection.
@@ -878,12 +990,12 @@ def insert_transaction_sqlite(conn: sqlite3.Connection, transaction_data: Dict[s
                 """,
                 (
                     transaction_data["date"],
-                    transaction_data["description"],
-                    transaction_data["amount"],
-                    transaction_data.get("category"),
-                    transaction_data.get("account"),
+                    payload.get("description"),
+                    payload.get("amount"),
+                    payload.get("category"),
+                    payload.get("account"),
                     transaction_data.get("account_id"),
-                    transaction_data["source_file"],
+                    payload.get("source_file"),
                     transaction_data.get("import_timestamp"),
                     transaction_data["duplicate_hash"],
                     transaction_data.get("is_transfer", 0),
@@ -894,10 +1006,18 @@ def insert_transaction_sqlite(conn: sqlite3.Connection, transaction_data: Dict[s
         return int(cursor.lastrowid)
     except sqlite3.IntegrityError as exc:
         logger.warning("Integrity error inserting transaction: %s", exc)
-        raise DatabaseError("Transaction violates database constraints.") from exc
+        raise DatabaseError(
+            "Transaction violates database constraints",
+            details={"operation": "insert_transaction", "error": str(exc)},
+            original_error=exc
+        ) from exc
     except sqlite3.Error as exc:
         logger.exception("Unexpected SQLite error inserting transaction.")
-        raise DatabaseError("Failed to insert transaction.") from exc
+        raise DatabaseError(
+            "Failed to insert transaction",
+            details={"operation": "insert_transaction", "error": str(exc)},
+            original_error=exc
+        ) from exc
 
 
 def bulk_insert_transactions_sqlite(
@@ -910,14 +1030,15 @@ def bulk_insert_transactions_sqlite(
 
     for transaction in transactions:
         try:
+            payload = encrypt_transaction_payload(transaction)
             required_tuple = (
                 transaction["date"],
-                transaction["description"],
-                transaction["amount"],
-                transaction.get("category"),
-                transaction.get("account"),
+                payload.get("description"),
+                payload.get("amount"),
+                payload.get("category"),
+                payload.get("account"),
                 transaction.get("account_id"),
-                transaction["source_file"],
+                payload.get("source_file"),
                 transaction.get("import_timestamp"),
                 transaction["duplicate_hash"],
                 transaction.get("is_transfer", 0),
@@ -957,10 +1078,18 @@ def bulk_insert_transactions_sqlite(
         return len(to_insert), skipped
     except sqlite3.IntegrityError as exc:
         logger.warning("Integrity error bulk inserting transactions: %s", exc)
-        raise DatabaseError("One or more transactions violate database constraints.") from exc
+        raise DatabaseError(
+            "One or more transactions violate database constraints",
+            details={"operation": "bulk_insert", "error": str(exc)},
+            original_error=exc
+        ) from exc
     except sqlite3.Error as exc:
         logger.exception("Unexpected SQLite error during bulk insert.")
-        raise DatabaseError("Failed to bulk insert transactions.") from exc
+        raise DatabaseError(
+            "Failed to bulk insert transactions",
+            details={"operation": "bulk_insert", "error": str(exc)},
+            original_error=exc
+        ) from exc
 
 
 def query_transactions_sqlite(
@@ -990,12 +1119,12 @@ def query_transactions_sqlite(
         SELECT
             id,
             date,
-            description,
-            amount,
-            category,
-            account,
+            decrypt_text(description) AS description,
+            decrypt_numeric(amount) AS amount,
+            decrypt_text(category) AS category,
+            decrypt_text(account) AS account,
             account_id,
-            source_file,
+            decrypt_text(source_file) AS source_file,
             import_timestamp,
             duplicate_hash,
             is_transfer,
@@ -1015,21 +1144,24 @@ def query_transactions_sqlite(
         conditions.append("date <= ?")
         params.append(filters["date_end"])
     if filters.get("amount_min") is not None:
-        conditions.append("amount >= ?")
+        conditions.append("decrypt_numeric(amount) >= ?")
         params.append(filters["amount_min"])
     if filters.get("amount_max") is not None:
-        conditions.append("amount <= ?")
+        conditions.append("decrypt_numeric(amount) <= ?")
         params.append(filters["amount_max"])
     if filters.get("category"):
-        conditions.append("LOWER(category) LIKE LOWER(?)")
+        conditions.append("LOWER(decrypt_text(category)) LIKE LOWER(?)")
         params.append(f"%{filters['category']}%")
     if filters.get("description_keywords"):
         keywords = filters["description_keywords"]
         if isinstance(keywords, str):
             keywords = [keywords]
-        keyword_conditions = ["LOWER(description) LIKE LOWER(?)" for _ in keywords]
+        keyword_conditions = ["LOWER(decrypt_text(description)) LIKE LOWER(?)" for _ in keywords]
         conditions.append(f"({' OR '.join(keyword_conditions)})")
         params.extend([f"%{kw}%" for kw in keywords])
+    if filters.get("source_file"):
+        conditions.append("LOWER(decrypt_text(source_file)) LIKE LOWER(?)")
+        params.append(f"%{filters['source_file']}%")
     if filters.get("account_id") is not None:
         conditions.append("account_id = ?")
         params.append(filters["account_id"])
@@ -1066,7 +1198,11 @@ def query_transactions_sqlite(
         return [dict(row) for row in rows]
     except sqlite3.Error as exc:
         logger.exception("Failed to query transactions via SQLite.")
-        raise DatabaseError("Failed to retrieve transactions.") from exc
+        raise DatabaseError(
+            "Failed to retrieve transactions",
+            details={"operation": "query_transactions", "error": str(exc)},
+            original_error=exc
+        ) from exc
 
 
 def delete_transaction_sqlite(conn: sqlite3.Connection, transaction_id: int) -> None:
@@ -1081,7 +1217,11 @@ def delete_transaction_sqlite(conn: sqlite3.Connection, transaction_id: int) -> 
         logger.debug("Deleted transaction id=%s", transaction_id)
     except sqlite3.Error as exc:
         logger.exception("Failed to delete transaction id=%s", transaction_id)
-        raise DatabaseError("Failed to delete transaction.") from exc
+        raise DatabaseError(
+            "Failed to delete transaction",
+            details={"operation": "delete_transaction", "transaction_id": transaction_id, "error": str(exc)},
+            original_error=exc
+        ) from exc
 
 
 def get_transaction_count_sqlite(conn: sqlite3.Connection) -> int:
@@ -1098,6 +1238,10 @@ def get_transaction_count_sqlite(conn: sqlite3.Connection) -> int:
         return total
     except sqlite3.Error as exc:
         logger.exception("Failed to count transactions via SQLite.")
-        raise DatabaseError("Failed to count transactions.") from exc
+        raise DatabaseError(
+            "Failed to count transactions",
+            details={"operation": "count_transactions", "error": str(exc)},
+            original_error=exc
+        ) from exc
 
 

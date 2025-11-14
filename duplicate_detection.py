@@ -10,6 +10,8 @@ import logging
 from typing import Dict, Any, List, Set
 from datetime import datetime
 
+from exceptions import DuplicateDetectionError
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,10 @@ class DuplicateDetector:
         
         # Validate hash algorithm
         if self.hash_algorithm not in hashlib.algorithms_available:
-            raise ValueError(f"Unsupported hash algorithm: {hash_algorithm}")
+            raise DuplicateDetectionError(
+                f"Unsupported hash algorithm: {hash_algorithm}",
+                details={"hash_algorithm": hash_algorithm, "available_algorithms": list(hashlib.algorithms_available)}
+            )
         
         logger.info(
             f"Duplicate detector initialized with key fields: {key_fields}, "
@@ -87,7 +92,10 @@ class DuplicateDetector:
         hash_parts = []
         for field in self.key_fields:
             if field not in transaction:
-                raise KeyError(f"Required key field '{field}' not found in transaction")
+                raise DuplicateDetectionError(
+                    f"Required key field '{field}' not found in transaction",
+                    details={"missing_field": field, "key_fields": self.key_fields, "transaction_keys": list(transaction.keys())}
+                )
             value = transaction[field]
             normalized = self._normalize_value(value)
             hash_parts.append(f"{field}:{normalized}")

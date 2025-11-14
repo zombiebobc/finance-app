@@ -71,12 +71,15 @@ def test_database():
     engine = create_engine(connection_string)
     Base.metadata.create_all(engine)
     
-    yield connection_string
-    
-    # Cleanup
-    engine.dispose()
-    if os.path.exists(temp_db):
-        os.unlink(temp_db)
+    try:
+        yield connection_string
+    finally:
+        engine.dispose()
+        if os.path.exists(temp_db):
+            try:
+                os.unlink(temp_db)
+            except PermissionError:
+                pass
 
 
 @pytest.fixture

@@ -1,4 +1,9 @@
 balance_history_days: 30
+budget_category_aliases:
+  Shopping:
+  - Purchase Target
+  - Purchase Amazon
+  - Purchase Taco Bell
 column_mappings:
   account:
   - account
@@ -54,22 +59,16 @@ column_mappings:
   - vendor
   - narrative
 database:
-  data_dir: data
-  path: transactions.db
-  type: sqlite
   connection_string: sqlite:///data/transactions.db
+  data_dir: data
   income_categories:
   - Salary
   - Paycheck
   - Bonus
   - Freelance
   - Reimbursement
-show_projections: true
-budget_category_aliases:
-  Shopping:
-  - Purchase Target
-  - Purchase Amazon
-  - Purchase Taco Bell
+  path: transactions.db
+  type: sqlite
 default_time_frame: Current
 duplicate_detection:
   hash_algorithm: md5
@@ -78,17 +77,33 @@ duplicate_detection:
   - description
   - amount
 logging:
-  file: data/import.log
+  # Log file path - file logging is enabled by default if this is specified
+  # Set to null or remove to disable file logging
+  file: logs/app.log
+  # Log format - should include %(asctime)s for timestamps
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
   level: INFO
+
+# Email alerts (optional) - send critical errors via email
+# email_alerts:
+#   enabled: false
+#   smtp_host: smtp.gmail.com
+#   smtp_port: 587
+#   use_tls: true
+#   username: your-email@gmail.com
+#   password: your-app-password
+#   from_address: your-email@gmail.com
+#   to_addresses:
+#     - admin@example.com
+#   level: CRITICAL  # Only send emails for CRITICAL level errors
+#   subject: "Finance App Critical Error"
 net_worth_goal: 80000.0
 net_worth_history_days: 90
 processing:
   amount_decimal_places: 2
-  chunk_size: 10000
   auto_chunk_mb: 25
-  max_error_rows: 500
-  error_ratio: 0.1
+  chunk_size: 10000
   date_formats:
   - '%Y-%m-%d'
   - '%m/%d/%Y'
@@ -99,11 +114,22 @@ processing:
   - '%Y.%m.%d'
   - '%m.%d.%Y'
   - '%d.%m.%Y'
-  output_date_format: '%Y-%m-%d'
+  error_ratio: 0.1
   fallback_values:
     amount: 0.0
-    description: 'Unknown transaction'
-    category: 'Uncategorized'
+    category: Uncategorized
+    description: Unknown transaction
+  max_error_rows: 500
+  output_date_format: '%Y-%m-%d'
+security:
+  encryption_enabled: true
+  encryption_key: 3rMJcSxuWPwVQwXQFojNF9rLbn06IqtVXcQauG9-y2Y=
+  key_source: env
+  # Timezone configuration (default: UTC)
+  # All timestamps are stored in UTC in the database
+  # Set this to a different timezone if needed for display/processing
+  timezone: UTC
+show_projections: true
 show_sparklines: true
 standard_fields:
 - date
